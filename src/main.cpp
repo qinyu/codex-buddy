@@ -33,8 +33,9 @@ const int USAGE_ROW2_Y = 172;
 const int USAGE_ROW3_Y = 202;
 const int USAGE_SLOT_H = 30;
 const int USAGE_PCT_COL_W = 22;
-const int USAGE_LABEL_COL_W = 18;
-const int USAGE_INNER_GAP = 2;
+const int USAGE_LABEL_COL_W = 20;   // room for tot/1st/API + gap from bar
+const int USAGE_INNER_GAP = 2;      // pct ↔ bar
+const int USAGE_BAR_LABEL_GAP = 4;  // bar ↔ window label (was 2; felt flush)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 const int LED_PIN = -1;          // no user LED on StickS3
 #else
@@ -64,11 +65,14 @@ uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
 bool    btnBLong    = false;
 const uint16_t BUTTON_STABLE_MS = 40;
+const uint16_t BTN_A_DOUBLE_MS = 280;  // short×2 → next agent; single → INFO
 bool    btnAStablePress = false;
 bool    btnBStablePress = false;
 bool    btnBHandled     = false;
+bool    btnAPendingClick = false;
 uint32_t btnADownMs     = 0;
 uint32_t btnBDownMs     = 0;
+uint32_t btnAPendingUntil = 0;
 
 enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
@@ -1073,9 +1077,10 @@ void drawPet() {
 }
 
 static uint16_t usageColor(uint8_t pct, const Palette& p) {
-  if (pct >= 70) return HOT;
-  if (pct >= 35) return GREEN;
-  return 0x04DF;
+  // Same severity ladder as reset countdown: green → orange → red (no blue).
+  if (pct >= 70) return HOT;       // red-orange
+  if (pct >= 35) return 0xFD20;    // orange
+  return GREEN;
 }
 
 static uint16_t resetColor(uint32_t resetAt, const char* windowLabel, bool live, const Palette& p) {
@@ -1151,13 +1156,16 @@ static const char* usageTopTitle() {
 }
 
 static const char* packNameForAgentId(const char* agentId) {
+  // Ping Island MascotView exports (idle/working/warning/dragging).
   if (!agentId || !*agentId) return "Mao";
   if (strcmp(agentId, "codex") == 0) return "Codex";
   if (strcmp(agentId, "pi") == 0) return "Pi";
   if (strcmp(agentId, "hermes") == 0) return "Hermes";
   if (strcmp(agentId, "cursor") == 0) return "Cursor";
-  if (strcmp(agentId, "dsh") == 0) return "Dsh";
-  return agentId;
+  // Island has no DSH mascot — reuse Kimi keyboard-orb.
+  if (strcmp(agentId, "dsh") == 0 || strcmp(agentId, "kimi") == 0) return "Kimi";
+  // claude / gemini / unknown: Mao until a Stick pack is shipped.
+  return "Mao";
 }
 
 static void ensureAgentCharacterPack() {
@@ -1236,7 +1244,8 @@ static void drawUsageSlotOn(lgfx::v1::LGFXBase* dst, int x, int w, int y,
   const int barH = expanded ? 10 : 8;
   const int midY = y + textH / 2;
   const int barX = x + USAGE_PCT_COL_W + USAGE_INNER_GAP;
-  const int barW = w - USAGE_PCT_COL_W - USAGE_LABEL_COL_W - USAGE_INNER_GAP * 2;
+  const int barW = w - USAGE_PCT_COL_W - USAGE_LABEL_COL_W
+                 - USAGE_INNER_GAP - USAGE_BAR_LABEL_GAP;
   const int barY = midY - barH / 2;
 
   dst->setTextDatum(ML_DATUM);
@@ -1345,6 +1354,28 @@ static void drawUsageProviderHeader(lgfx::v1::LGFXBase* dst, int x, int w, int y
   }
 }
 
+static void drawUsageAgentChrome(lgfx::v1::LGFXBase* dst, int titleX, int rightX, int y0,
+                                 bool live, const Palette& p) {
+  dst->setTextSize(1);
+  dst->setTextDatum(TL_DATUM);
+  dst->setTextColor(p.textDim, p.bg);
+  dst->drawString(usageTopTitle(), titleX, y0);
+  dst->setTextColor(usagePersonaColor(activeState, p), p.bg);
+  dst->drawString(usagePersonaLabel(activeState), titleX, y0 + 10);
+  dst->setTextDatum(TR_DATUM);
+  // Active agent count (and page) so A-key paging is discoverable.
+  if (tama.codexAgentCount >= 1) {
+    char page[8];
+    uint8_t idx = tama.codexAgentIndex;
+    if (idx >= tama.codexAgentCount) idx = tama.codexAgentCount - 1;
+    snprintf(page, sizeof(page), "%u/%u", (unsigned)(idx + 1), (unsigned)tama.codexAgentCount);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString(page, rightX, y0);
+  }
+  dst->setTextColor(live ? GREEN : HOT, p.bg);
+  dst->drawString(live ? "LIVE" : "WAIT", rightX, y0 + 10);
+}
+
 static void drawUsageDashboard() {
   ensureAgentCharacterPack();
   const Palette& p = characterPalette();
@@ -1354,13 +1385,19 @@ static void drawUsageDashboard() {
   static uint8_t cachedProvCnt = 0xFF;
   static uint8_t cachedMeterCount = 0xFF;
   static uint8_t cachedPersona = 0xFF;
+  static uint8_t cachedAgentIdx = 0xFF;
+  static uint8_t cachedAgentCnt = 0xFF;
+  static char cachedAgentTitle[16] = "";
 
   if (!usageLiveKnown || usageLastLive != live
       || strncmp(cachedUsageLabel, usageProviderTitle(), sizeof(cachedUsageLabel)) != 0
       || cachedProvIdx != tama.codexProviderIndex
       || cachedProvCnt != tama.codexProviderCount
       || cachedMeterCount != tama.codexMeterCount
-      || cachedPersona != (uint8_t)activeState) {
+      || cachedPersona != (uint8_t)activeState
+      || cachedAgentIdx != tama.codexAgentIndex
+      || cachedAgentCnt != tama.codexAgentCount
+      || strncmp(cachedAgentTitle, usageTopTitle(), sizeof(cachedAgentTitle)) != 0) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
@@ -1370,6 +1407,10 @@ static void drawUsageDashboard() {
     cachedProvCnt = tama.codexProviderCount;
     cachedMeterCount = tama.codexMeterCount;
     cachedPersona = (uint8_t)activeState;
+    cachedAgentIdx = tama.codexAgentIndex;
+    cachedAgentCnt = tama.codexAgentCount;
+    strncpy(cachedAgentTitle, usageTopTitle(), sizeof(cachedAgentTitle) - 1);
+    cachedAgentTitle[sizeof(cachedAgentTitle) - 1] = 0;
   }
 
   spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
@@ -1388,15 +1429,7 @@ static void drawUsageDashboard() {
 
   if (usageFullPushNeeded) {
     spr.fillRect(0, 0, W, USAGE_PET_TOP, p.bg);
-    spr.setTextSize(1);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(p.textDim, p.bg);
-    spr.drawString(usageTopTitle(), 8, 4);
-    spr.setTextColor(usagePersonaColor(activeState, p), p.bg);
-    spr.drawString(usagePersonaLabel(activeState), 8, 14);
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(live ? GREEN : HOT, p.bg);
-    spr.drawString(live ? "LIVE" : "WAIT", W - 8, 14);
+    drawUsageAgentChrome(&spr, 8, W - 8, 4, live, p);
   }
 
   // Usage block: provider name + page, then meter rows.
@@ -1415,13 +1448,19 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedProvIdxLand = 0xFF;
   static uint8_t cachedProvCntLand = 0xFF;
   static char cachedUsageLabelLand[16] = "";
-  static uint8_t cachedPersonaLand = 0xFF;
+  static uint8_t cachedAgentIdxLand = 0xFF;
+  static uint8_t cachedAgentCntLand = 0xFF;
+  static char cachedAgentTitleLand[16] = "";
+  static uint8_t cachedMeterCountLand = 0xFF;
 
   if (!usageLiveKnown || usageLastLive != live
       || strncmp(cachedUsageLabelLand, usageProviderTitle(), sizeof(cachedUsageLabelLand)) != 0
       || cachedProvIdxLand != tama.codexProviderIndex
       || cachedProvCntLand != tama.codexProviderCount
-      || cachedPersonaLand != (uint8_t)activeState) {
+      || cachedMeterCountLand != tama.codexMeterCount
+      || cachedAgentIdxLand != tama.codexAgentIndex
+      || cachedAgentCntLand != tama.codexAgentCount
+      || strncmp(cachedAgentTitleLand, usageTopTitle(), sizeof(cachedAgentTitleLand)) != 0) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
@@ -1429,31 +1468,36 @@ static void drawUsageDashboardLandscape() {
     cachedUsageLabelLand[sizeof(cachedUsageLabelLand) - 1] = 0;
     cachedProvIdxLand = tama.codexProviderIndex;
     cachedProvCntLand = tama.codexProviderCount;
-    cachedPersonaLand = (uint8_t)activeState;
+    cachedMeterCountLand = tama.codexMeterCount;
+    cachedAgentIdxLand = tama.codexAgentIndex;
+    cachedAgentCntLand = tama.codexAgentCount;
+    strncpy(cachedAgentTitleLand, usageTopTitle(), sizeof(cachedAgentTitleLand) - 1);
+    cachedAgentTitleLand[sizeof(cachedAgentTitleLand) - 1] = 0;
   }
 
-  M5.Lcd.setRotation(clockOrient);
+  // Keep landscape rotation sticky — setRotation every frame (esp. 1↔0) flickers.
+  bool orientChanged = paintedOrient != clockOrient;
+  if (orientChanged || M5.Lcd.getRotation() != clockOrient) {
+    M5.Lcd.setRotation(clockOrient);
+  }
   const int lw = M5.Lcd.width();
   const int lh = M5.Lcd.height();
   const int leftW = 104;
   const int rightX = leftW + 8;
   const int rightW = lw - rightX - 8;
-  // Keep portrait-like row spacing; shift the block down to reduce bottom gap.
+  // Chrome: title @y0, SLEEP/LIVE @y0+10 (8px) → pack meters flush under that.
   const int landSlotH = USAGE_SLOT_H;
-  const int landRows = (!tama.connected || tama.codexMeterCount >= 3) ? 3
-                      : (tama.codexMeterCount >= 2) ? 2 : 1;
   const int landProvH = 12;
-  const int landBlockH = landProvH + landRows * landSlotH;
-  const int landBottomPad = 4;
-  const int landProvY = lh - landBottomPad - landBlockH;
+  const int landChromeY0 = 4;
+  const int landProvY = landChromeY0 + 10 + 8 + 6;  // under SLEEP/LIVE (+4px vs prior)
   const int landRow1Y = landProvY + landProvH;
   const int landRow2Y = landRow1Y + landSlotH;
   const int landRow3Y = landRow2Y + landSlotH;
 
-  bool repaint = paintedOrient != clockOrient || usageFullPushNeeded;
-  if (repaint) {
+  if (orientChanged) {
     M5.Lcd.fillScreen(p.bg);
     paintedOrient = clockOrient;
+    usageFullPushNeeded = true;
   }
 
   static bool cachedLive = false;
@@ -1461,26 +1505,68 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
   static int cachedPetH = 0;
-  bool panelChanged = repaint || cachedOrient != clockOrient || cachedLive != live;
+  bool panelChanged = usageFullPushNeeded || cachedOrient != clockOrient || cachedLive != live;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(p.textDim, p.bg);
-    M5.Lcd.drawString(usageTopTitle(), rightX, 4);
-    M5.Lcd.setTextColor(usagePersonaColor(activeState, p), p.bg);
-    M5.Lcd.drawString(usagePersonaLabel(activeState), rightX, 14);
-    M5.Lcd.setTextDatum(TR_DATUM);
-    M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-    M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 14);
+    drawUsageAgentChrome(&M5.Lcd, rightX, lw - 8, landChromeY0, live, p);
     cachedLive = live;
     cachedOrient = clockOrient;
   }
 
-  drawUsageProviderHeader(&M5.Lcd, rightX, rightW, landProvY, live, p);
-  drawUsageMeterZone(&M5.Lcd, rightX, rightW, live, p,
-                     landRow1Y, landRow2Y, landRow3Y, landRow2Y, lh - landRow2Y);
+  // Right-panel meters were redrawn every ~16ms (loop delay) → visible flicker on
+  // provider title + % rows. Only repaint when payload changes or once/min for
+  // countdown text (resetTimeText granularity is minutes).
+  static uint8_t cachedPct1 = 0xFF, cachedPct2 = 0xFF, cachedPct3 = 0xFF;
+  static uint32_t cachedR1 = 0, cachedR2 = 0, cachedR3 = 0;
+  static char cachedDisp1[12] = "", cachedDisp2[12] = "", cachedDisp3[12] = "";
+  static char cachedWin1[8] = "", cachedWin2[8] = "", cachedWin3[8] = "";
+  static uint32_t lastMeterMinute = 0xFFFFFFFF;
+  uint32_t meterMinute = millis() / 60000UL;
+  bool metersChanged =
+      panelChanged
+      || cachedPct1 != tama.codexPrimary
+      || cachedPct2 != tama.codexSecondary
+      || cachedPct3 != tama.codexTertiary
+      || cachedR1 != tama.codexPrimaryResetsAt
+      || cachedR2 != tama.codexSecondaryResetsAt
+      || cachedR3 != tama.codexTertiaryResetsAt
+      || strncmp(cachedDisp1, tama.codexPrimaryDisplay, sizeof(cachedDisp1)) != 0
+      || strncmp(cachedDisp2, tama.codexSecondaryDisplay, sizeof(cachedDisp2)) != 0
+      || strncmp(cachedDisp3, tama.codexTertiaryDisplay, sizeof(cachedDisp3)) != 0
+      || strncmp(cachedWin1, usagePrimaryWindowLabel(), sizeof(cachedWin1)) != 0
+      || strncmp(cachedWin2, usageSecondaryWindowLabel(), sizeof(cachedWin2)) != 0
+      || strncmp(cachedWin3, usageTertiaryWindowLabel(), sizeof(cachedWin3)) != 0
+      || lastMeterMinute != meterMinute;
+
+  if (metersChanged) {
+    // Clear meter block (keep chrome) so % / countdown digits do not ghost.
+    if (!panelChanged) {
+      M5.Lcd.fillRect(rightX - 2, landProvY, rightW + 4, lh - landProvY, p.bg);
+    }
+    drawUsageProviderHeader(&M5.Lcd, rightX, rightW, landProvY, live, p);
+    drawUsageMeterZone(&M5.Lcd, rightX, rightW, live, p,
+                       landRow1Y, landRow2Y, landRow3Y, landRow2Y, lh - landRow2Y);
+    cachedPct1 = tama.codexPrimary;
+    cachedPct2 = tama.codexSecondary;
+    cachedPct3 = tama.codexTertiary;
+    cachedR1 = tama.codexPrimaryResetsAt;
+    cachedR2 = tama.codexSecondaryResetsAt;
+    cachedR3 = tama.codexTertiaryResetsAt;
+    strncpy(cachedDisp1, tama.codexPrimaryDisplay, sizeof(cachedDisp1) - 1);
+    cachedDisp1[sizeof(cachedDisp1) - 1] = 0;
+    strncpy(cachedDisp2, tama.codexSecondaryDisplay, sizeof(cachedDisp2) - 1);
+    cachedDisp2[sizeof(cachedDisp2) - 1] = 0;
+    strncpy(cachedDisp3, tama.codexTertiaryDisplay, sizeof(cachedDisp3) - 1);
+    cachedDisp3[sizeof(cachedDisp3) - 1] = 0;
+    strncpy(cachedWin1, usagePrimaryWindowLabel(), sizeof(cachedWin1) - 1);
+    cachedWin1[sizeof(cachedWin1) - 1] = 0;
+    strncpy(cachedWin2, usageSecondaryWindowLabel(), sizeof(cachedWin2) - 1);
+    cachedWin2[sizeof(cachedWin2) - 1] = 0;
+    strncpy(cachedWin3, usageTertiaryWindowLabel(), sizeof(cachedWin3) - 1);
+    cachedWin3[sizeof(cachedWin3) - 1] = 0;
+    lastMeterMinute = meterMinute;
+  }
 
   if (characterLoaded()) {
     bool canvasChanged = false;
@@ -1501,7 +1587,7 @@ static void drawUsageDashboardLandscape() {
     if (cachedPetW == leftW && cachedPetH == lh) {
       frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
                                      58, 0, 0, leftW, lh);
-      if (repaint || canvasChanged || stateChanged || frameDrawn) {
+      if (orientChanged || canvasChanged || stateChanged || frameDrawn) {
         usagePetSpr.pushSprite(0, 0);
       }
     } else {
@@ -1516,7 +1602,6 @@ static void drawUsageDashboardLandscape() {
   }
 
   M5.Lcd.setTextDatum(TL_DATUM);
-  M5.Lcd.setRotation(0);
   usageFullPushNeeded = false;
 }
 
@@ -1690,6 +1775,7 @@ void loop() {
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
       menuOpen = settingsOpen = resetOpen = false;
+      btnAPendingClick = false;
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
@@ -1722,25 +1808,21 @@ void loop() {
 
   if (btnAStablePress && M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
-    if (!inPrompt && !resetOpen && !settingsOpen && !menuOpen
-        && displayMode == DISP_NORMAL && tama.codexAgentCount > 1) {
-      beep(1800, 30);
-      sendCmd("{\"cmd\":\"agent\",\"action\":\"prev\"}");
-    } else {
-      beep(800, 60);
-      if (resetOpen) { resetOpen = false; }
-      else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
-      else {
-        menuOpen = !menuOpen;
-        menuSel = 0;
-        if (!menuOpen) characterInvalidate();
-      }
-      Serial.println(menuOpen ? "menu open" : "menu close");
+    btnAPendingClick = false;  // long press cancels a pending single/double
+    beep(800, 60);
+    if (resetOpen) { resetOpen = false; }
+    else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
+    else {
+      menuOpen = !menuOpen;
+      menuSel = 0;
+      if (!menuOpen) characterInvalidate();
     }
+    Serial.println(menuOpen ? "menu open" : "menu close");
   }
   if (M5.BtnA.wasReleased()) {
     if (btnAStablePress && !btnALong && !swallowBtnA) {
       if (inPrompt) {
+        btnAPendingClick = false;
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"accept\"}", tama.promptId);
         sendCmd(cmd);
@@ -1750,19 +1832,30 @@ void loop() {
         beep(2400, 60);
         if (tookS < 5) triggerOneShot(P_HEART, 2000);
       } else if (resetOpen) {
+        btnAPendingClick = false;
         beep(1800, 30);
         resetSel = (resetSel + 1) % RESET_N;
         resetConfirmIdx = 0xFF;
       } else if (settingsOpen) {
+        btnAPendingClick = false;
         beep(1800, 30);
         settingsSel = (settingsSel + 1) % SETTINGS_N;
       } else if (menuOpen) {
+        btnAPendingClick = false;
         beep(1800, 30);
         menuSel = (menuSel + 1) % MENU_N;
       } else if (displayMode == DISP_NORMAL && tama.codexAgentCount > 1) {
-        beep(2400, 30);
-        sendCmd("{\"cmd\":\"agent\",\"action\":\"next\"}");
+        // Double-click → next agent; single short → INFO (deferred).
+        if (btnAPendingClick && (int32_t)(now - btnAPendingUntil) < 0) {
+          btnAPendingClick = false;
+          beep(2400, 30);
+          sendCmd("{\"cmd\":\"agent\",\"action\":\"next\"}");
+        } else {
+          btnAPendingClick = true;
+          btnAPendingUntil = now + BTN_A_DOUBLE_MS;
+        }
       } else {
+        btnAPendingClick = false;
         beep(1800, 30);
         displayMode = (displayMode == DISP_NORMAL) ? DISP_INFO : DISP_NORMAL;
         applyDisplayMode();
@@ -1772,6 +1865,16 @@ void loop() {
     swallowBtnA = false;
     btnADownMs = 0;
     btnAStablePress = false;
+  }
+  // Flush deferred single short-press A → INFO (no second click in window).
+  if (btnAPendingClick && (int32_t)(now - btnAPendingUntil) >= 0
+      && !M5.BtnA.isPressed()) {
+    btnAPendingClick = false;
+    if (!inPrompt && !resetOpen && !settingsOpen && !menuOpen) {
+      beep(1800, 30);
+      displayMode = (displayMode == DISP_NORMAL) ? DISP_INFO : DISP_NORMAL;
+      applyDisplayMode();
+    }
   }
 
   // BtnB: provider short=next / long=prev; else heart / menus
@@ -1866,6 +1969,12 @@ void loop() {
   static bool wasLandscape = false;
   static bool wasLandscapeUsage = false;
   if (clocking != wasClocking || landscapeClock != wasLandscape || landscapeUsage != wasLandscapeUsage) {
+    if (wasLandscapeUsage && !landscapeUsage) {
+      // Leave sticky landscape rotation; portrait sprite path expects rot 0.
+      M5.Lcd.setRotation(0);
+      paintedOrient = 0;
+      usageFullPushNeeded = true;
+    }
     if (clocking && !landscapeClock) {
       characterSetPeekWindow(25, 80);
       characterSetPeekBottomAlign(true);

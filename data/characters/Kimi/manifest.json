@@ -1,5 +1,5 @@
 {
-  "name": "Cursor",
+  "name": "Kimi",
   "colors": {
     "body": "#FFFFFF",
     "bg": "#000000",
@@ -8,13 +8,13 @@
     "ink": "#000000"
   },
   "states": {
-    "sleep": "idle.gif",
+    "sleep": "sleep.gif",
     "idle": "idle.gif",
     "busy": "busy.gif",
     "attention": "attention.gif",
-    "completed": "busy.gif",
-    "celebrate": "busy.gif",
+    "completed": "completed.gif",
+    "celebrate": "celebrate.gif",
     "dizzy": "dizzy.gif",
-    "heart": "idle.gif"
+    "heart": "heart.gif"
   }
 }

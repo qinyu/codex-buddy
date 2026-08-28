@@ -299,6 +299,25 @@ const Palette& characterPalette() { return pal; }
 // landscape clock). Caller owns clearing. Advances frame timing so
 // animation runs even when characterTick() is bypassed.
 bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
+  if (textMode) {
+    if (!loaded || curState >= N_STATES) return false;
+    TextState& ts = textStates[curState];
+    if (ts.nFrames == 0) return false;
+    const char* line = ts.frames[textFrame % ts.nFrames];
+    int len = (int)strlen(line);
+    if (len < 1) len = 1;
+    int textSize = 3;
+    while (textSize > 1 && len * 6 * textSize > tgt->width() - 4) textSize--;
+    int glyphW = 6 * textSize;
+    int glyphH = 8 * textSize;
+    int tw = len * glyphW;
+    tgt->fillRect(cx - tw / 2 - 2, cy - glyphH / 2 - 2, tw + 4, glyphH + 4, pal.bg);
+    tgt->setTextColor(pal.body, pal.bg);
+    tgt->setTextSize(textSize);
+    tgt->setCursor(cx - tw / 2, cy - glyphH / 2);
+    tgt->print(line);
+    return true;
+  }
   uint32_t now = millis();
   if (!gifOpen) {
     if (animPauseUntil && now >= animPauseUntil && curState < N_STATES) {
@@ -340,6 +359,9 @@ bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy) {
 
 bool characterRenderTo(lgfx::v1::LGFXBase* tgt, int cx, int cy, uint8_t scalePct,
                        int minX, int minY, int maxX, int maxY) {
+  if (textMode) {
+    return characterRenderTo(tgt, cx, cy);
+  }
   uint32_t now = millis();
   if (!gifOpen) {
     if (animPauseUntil && now >= animPauseUntil && curState < N_STATES) {

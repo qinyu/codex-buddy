@@ -215,7 +215,26 @@ def state_from_hook_event(event_name: str) -> str | None:
         return None
     if key in {"permissionrequest"}:
         return "attention"
-    if key in {"userpromptsubmit", "pretooluse", "posttooluse", "notification", "precompact", "postcompact"}:
+    # Codex / Claude-style + Cursor camelCase (beforeSubmitPrompt → beforesubmitprompt).
+    if key in {
+        "userpromptsubmit",
+        "beforesubmitprompt",
+        "pretooluse",
+        "posttooluse",
+        "posttoolusefailure",
+        "notification",
+        "precompact",
+        "postcompact",
+        "afteragentresponse",
+        "afteragentthought",
+        "subagentstart",
+        "subagentstop",
+        "beforeshellexecution",
+        "aftershellexecution",
+        "beforemcpexecution",
+        "aftermcpexecution",
+        "afterfileedit",
+    }:
         return "busy"
     if key in {"sessionend"}:
         return "gone"  # leave the carousel entirely
@@ -249,14 +268,115 @@ class HubAgent:
     last_completed_at: float | None = None
     session_id: str | None = None
     from_hook: bool = False
+    from_process: bool = False
+
+
+# Open IDE / service → show on Stick.
+# - Cursor/Codex: desktop app process
+# - Hermes/DSH: long-running gateway / web listener
+# - Pi: terminal `pi` session, or recent session transcript activity
+AGENT_PROCESS_MARKERS: dict[str, tuple[str, ...]] = {
+    "cursor": (r"/Applications/Cursor\.app/Contents/MacOS/Cursor\b",),
+    "codex": (
+        r"/Applications/ChatGPT\.app/Contents/Resources/codex\b",
+        r"/Applications/ChatGPT\.app/.*/Codex \(Service\)\.app/",
+    ),
+    "pi": (
+        r"/opt/homebrew/bin/pi(\s|$)",
+        r"/npm/node_modules/\.bin/pi(\s|$)",
+        r"@earendil-works/pi-coding-agent",
+        r"pi-coding-agent",
+    ),
+    "hermes": (r"hermes_cli\.main\b",),
+    "dsh": (r"/bin/dsh\b", r"\bdsh web\b", r"\bdsh\b.*--profile"),
+}
+
+PI_SESSION_ROOT = Path.home() / ".pi" / "agent" / "sessions"
+PI_SESSION_FRESH_SEC = 15 * 60.0
+
+
+def _pi_session_recently_active(now: float) -> bool:
+    """Pi terminal chats keep writing ~/.pi/agent/sessions/**/*.jsonl."""
+    root = PI_SESSION_ROOT
+    if not root.is_dir():
+        return False
+    try:
+        for path in root.rglob("*.jsonl"):
+            try:
+                if now - path.stat().st_mtime <= PI_SESSION_FRESH_SEC:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
+def scan_open_agent_ids() -> set[str] | None:
+    """Return open IDE/CLI agent ids, or None if the process list could not be read.
+
+    Callers must treat None as "unknown" and keep the previous roster — an empty
+    set means a successful scan that found no matching agents.
+    """
+    now = time.time()
+    try:
+        proc = subprocess.run(
+            ["ps", "ax", "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout or ""
+
+    found: set[str] = set()
+    for agent_id, patterns in AGENT_PROCESS_MARKERS.items():
+        for pattern in patterns:
+            if text and re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
+                found.add(agent_id)
+                break
+
+    # Pi: terminal conversation may not keep a long-lived `pi` argv; session
+    # transcripts update while the chat is open.
+    if "pi" not in found and _pi_session_recently_active(now):
+        found.add("pi")
+    return found
+
+
+class ProcessPresence:
+    """Cache process scans so the BLE loop does not shell out every push."""
+
+    def __init__(self, ttl_sec: float = 5.0) -> None:
+        self.ttl_sec = ttl_sec
+        self._cached_at = 0.0
+        self._alive: set[str] = set()
+        self._have_scan = False
+
+    def alive_ids(self, now: float | None = None) -> set[str] | None:
+        """Return cached/fresh alive ids, or None if the last scan failed."""
+        now = time.time() if now is None else now
+        if self._have_scan and now - self._cached_at < self.ttl_sec:
+            return set(self._alive)
+        scanned = scan_open_agent_ids()
+        if scanned is None:
+            # Keep last good roster; signal caller to skip sync drops.
+            return set(self._alive) if self._have_scan else None
+        self._alive = scanned
+        self._cached_at = now
+        self._have_scan = True
+        return set(self._alive)
 
 
 class AgentHub:
-    """Multi-agent roster fed by Ping Island-shaped hook events.
+    """Multi-agent roster for Stick carousel.
 
-    Presence is session-scoped: agents appear on activity and disappear on
-    SessionEnd or after ``presence_window`` with no events — not parked as
-    idle/sleep placeholders.
+    Presence sources:
+    - Open IDE/service process (Cursor app, Hermes/DSH listeners, Pi chat, …)
+    - Hook events (busy/attention animations); SessionEnd drops hook presence
     """
 
     def __init__(
@@ -308,6 +428,23 @@ class AgentHub:
         if self.current_id == aid:
             self.current_id = self.order[0] if self.order else None
             self._rotate_started_at = time.time()
+
+    def sync_process_presence(self, alive_ids: set[str], now: float | None = None) -> None:
+        """Keep agents visible while their IDE/CLI process is running."""
+        now = time.time() if now is None else now
+        for aid in sorted(alive_ids):
+            agent = self.ensure_agent(aid)
+            agent.from_process = True
+            agent.last_event_at = now
+            if agent.state not in {"busy", "attention", "completed"}:
+                agent.state = "idle"
+        for aid in list(self.order):
+            agent = self.agents.get(aid)
+            if agent is None:
+                continue
+            # IDE closed → leave carousel (hooks alone no longer pin an absent IDE).
+            if agent.from_process and aid not in alive_ids:
+                self.drop_agent(aid)
 
     def ingest_hook(self, payload: dict[str, Any], now: float | None = None) -> HubAgent | None:
         flat = flatten_hook_payload(payload)
@@ -2058,6 +2195,7 @@ async def send_usage_update(
     opencodex: OpenCodexProviders | None = None,
     force_refresh: bool = False,
     hub: AgentHub | None = None,
+    process_presence: ProcessPresence | None = None,
 ) -> None:
     if approvals and approvals.has_pending():
         return
@@ -2073,6 +2211,10 @@ async def send_usage_update(
 
     state = choose_state(args, snapshot, tracker)
     if hub is not None:
+        if process_presence is not None and not getattr(args, "no_process_presence", False):
+            alive = await asyncio.to_thread(process_presence.alive_ids)
+            if alive is not None:
+                hub.sync_process_presence(alive)
         hub.note_codex_fallback(state)
         hub.maybe_auto_rotate()
         hub_state = hub.apply_to_snapshot(snapshot)
@@ -2080,6 +2222,13 @@ async def send_usage_update(
             state = hub_state
     packet = snapshot.packet(state)
     line = json.dumps(packet, separators=(",", ":"))
+
+    # Quota windows are slow; skip duplicate BLE writes so Stick UI is not
+    # repainted every few seconds with identical meters/chrome.
+    last_line = getattr(send_usage_update, "_last_line", None)
+    if not force_refresh and last_line == line:
+        return
+    setattr(send_usage_update, "_last_line", line)
 
     if args.dry_run:
         print(line)
@@ -2110,12 +2259,15 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         rotate_busy_sec=args.agent_rotate_busy,
         manual_grace_sec=args.agent_manual_grace,
     )
+    process_presence = None if args.no_process_presence else ProcessPresence(ttl_sec=5.0)
     if args.dry_run:
         if args.agent_hub_sock:
             await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
         try:
             while True:
-                await send_usage_update(args, tracker, opencodex=opencodex, hub=hub)
+                await send_usage_update(
+                    args, tracker, opencodex=opencodex, hub=hub, process_presence=process_presence
+                )
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -2124,87 +2276,100 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         return
 
     assert BleakClient is not None
-    dev = await find_device(args.name, args.address, args.scan_timeout)
-    async with BleakClient(dev, timeout=args.connect_timeout) as client:
-        if args.pair and hasattr(client, "pair"):
+    # Presence IPC before BLE so Cursor/Pi/Hermes can register while Stick is offline.
+    if args.agent_hub_sock:
+        await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
+    try:
+        dev = await find_device(args.name, args.address, args.scan_timeout)
+        async with BleakClient(dev, timeout=args.connect_timeout) as client:
+            if args.pair and hasattr(client, "pair"):
+                try:
+                    await client.pair()
+                except Exception as exc:  # macOS often pairs on encrypted write
+                    print(f"[pair] continuing after pair attempt failed: {exc}", file=sys.stderr)
+
+            ble = BleSession(args, client)
+            await ble.start_notify()
+            approvals = CodexApprovalProxy(args, ble)
+            await approvals.start_ipc_server()
+            await approvals.start()
+            if args.test_approval:
+                await approvals.inject_test_request()
+
+            async def usage_runner() -> None:
+                while True:
+                    await send_usage_update(
+                        args,
+                        tracker,
+                        ble,
+                        approvals,
+                        opencodex,
+                        hub=hub,
+                        process_presence=process_presence,
+                    )
+                    if args.once:
+                        return
+                    await asyncio.sleep(args.interval)
+
+            async def device_runner() -> None:
+                while True:
+                    msg = await ble.incoming.get()
+                    if opencodex and msg.get("cmd") == "provider":
+                        action = str(msg.get("action") or "next")
+                        index = msg.get("index")
+                        parsed_index = int(index) if isinstance(index, int) else None
+                        opencodex.advance(action, parsed_index)
+                        if args.verbose:
+                            current = opencodex.current_report()
+                            print(
+                                f"[provider] {action} -> {current.get('label') or current.get('provider')} "
+                                f"({opencodex.index + 1}/{len(opencodex.reports)})",
+                                file=sys.stderr,
+                            )
+                        await send_usage_update(
+                            args,
+                            tracker,
+                            ble,
+                            approvals,
+                            opencodex,
+                            force_refresh=True,
+                            hub=hub,
+                            process_presence=process_presence,
+                        )
+                        continue
+                    if msg.get("cmd") == "agent":
+                        action = str(msg.get("action") or "next")
+                        index = msg.get("index")
+                        parsed_index = int(index) if isinstance(index, int) else None
+                        selected = hub.advance(action, parsed_index)
+                        if args.verbose and selected:
+                            print(
+                                f"[agent] {action} -> {selected.title} "
+                                f"({hub.current_index() + 1}/{len(hub.visible_ids())})",
+                                file=sys.stderr,
+                            )
+                        await send_usage_update(
+                            args,
+                            tracker,
+                            ble,
+                            approvals,
+                            opencodex,
+                            force_refresh=True,
+                            hub=hub,
+                            process_presence=process_presence,
+                        )
+                        continue
+                    await approvals.handle_device_message(msg)
+
             try:
-                await client.pair()
-            except Exception as exc:  # macOS often pairs on encrypted write
-                print(f"[pair] continuing after pair attempt failed: {exc}", file=sys.stderr)
-
-        ble = BleSession(args, client)
-        await ble.start_notify()
-        approvals = CodexApprovalProxy(args, ble)
-        await approvals.start_ipc_server()
-        await approvals.start()
-        if args.agent_hub_sock:
-            await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
-        if args.test_approval:
-            await approvals.inject_test_request()
-
-        async def usage_runner() -> None:
-            while True:
-                await send_usage_update(args, tracker, ble, approvals, opencodex, hub=hub)
                 if args.once:
+                    await usage_runner()
                     return
-                await asyncio.sleep(args.interval)
-
-        async def device_runner() -> None:
-            while True:
-                msg = await ble.incoming.get()
-                if opencodex and msg.get("cmd") == "provider":
-                    action = str(msg.get("action") or "next")
-                    index = msg.get("index")
-                    parsed_index = int(index) if isinstance(index, int) else None
-                    opencodex.advance(action, parsed_index)
-                    if args.verbose:
-                        current = opencodex.current_report()
-                        print(
-                            f"[provider] {action} -> {current.get('label') or current.get('provider')} "
-                            f"({opencodex.index + 1}/{len(opencodex.reports)})",
-                            file=sys.stderr,
-                        )
-                    await send_usage_update(
-                        args,
-                        tracker,
-                        ble,
-                        approvals,
-                        opencodex,
-                        force_refresh=True,
-                        hub=hub,
-                    )
-                    continue
-                if msg.get("cmd") == "agent":
-                    action = str(msg.get("action") or "next")
-                    index = msg.get("index")
-                    parsed_index = int(index) if isinstance(index, int) else None
-                    selected = hub.advance(action, parsed_index)
-                    if args.verbose and selected:
-                        print(
-                            f"[agent] {action} -> {selected.title} "
-                            f"({hub.current_index() + 1}/{len(hub.visible_ids())})",
-                            file=sys.stderr,
-                        )
-                    await send_usage_update(
-                        args,
-                        tracker,
-                        ble,
-                        approvals,
-                        opencodex,
-                        force_refresh=True,
-                        hub=hub,
-                    )
-                    continue
-                await approvals.handle_device_message(msg)
-
-        try:
-            if args.once:
-                await usage_runner()
-                return
-            await asyncio.gather(usage_runner(), device_runner())
-        finally:
-            await approvals.close_ipc_server()
-            await hub.close_ipc_server(args.agent_hub_sock)
+                await asyncio.gather(usage_runner(), device_runner())
+            finally:
+                await approvals.close_ipc_server()
+    finally:
+        await hub.close_ipc_server(args.agent_hub_sock)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2271,7 +2436,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for A/B on hardware approval requests",
     )
 
-    p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument(
+        "--interval",
+        type=float,
+        default=10.0,
+        help="Seconds between Stick BLE presence/state pushes (unchanged packets are skipped)",
+    )
     p.add_argument("--once", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--verbose", action="store_true")
@@ -2295,7 +2465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--opencodex-ttl",
         type=float,
-        default=8.0,
+        default=180.0,
         help="Seconds to reuse cached OpenCodex provider-quotas between refreshes",
     )
     p.add_argument(
@@ -2323,6 +2493,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent-rotate-idle", type=float, default=12.0)
     p.add_argument("--agent-rotate-busy", type=float, default=28.0)
     p.add_argument("--agent-manual-grace", type=float, default=45.0)
+    p.add_argument(
+        "--no-process-presence",
+        action="store_true",
+        help="Do not keep agents visible based on open IDE/service processes",
+    )
     return p
 
 

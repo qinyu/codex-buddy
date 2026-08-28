@@ -1,6 +1,5 @@
 {
   "name": "Pi",
-  "mode": "text",
   "colors": {
     "body": "#FFFFFF",
     "bg": "#000000",
@@ -9,13 +8,13 @@
     "ink": "#000000"
   },
   "states": {
-    "sleep": {"delay": 400, "frames": ["P."]},
-    "idle": {"delay": 300, "frames": ["Pi"]},
-    "busy": {"delay": 180, "frames": ["Pi*", "Pi"]},
-    "attention": {"delay": 160, "frames": ["!Pi!", "Pi"]},
-    "completed": {"delay": 220, "frames": ["Pi+", "Pi"]},
-    "celebrate": {"delay": 180, "frames": ["*Pi*", "Pi"]},
-    "dizzy": {"delay": 120, "frames": ["@Pi", "Pi"]},
-    "heart": {"delay": 200, "frames": ["<Pi>", "Pi"]}
+    "sleep": "idle.gif",
+    "idle": "idle.gif",
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "completed": "busy.gif",
+    "celebrate": "busy.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "idle.gif"
   }
 }

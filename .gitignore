@@ -1,6 +1,10 @@
 .pio/
 .vscode/
 .DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
 data/*
 !data/characters/
 data/characters/*
@@ -14,5 +18,6 @@ data/characters/*
 !data/characters/Hermes/**
 !data/characters/Cursor/
 !data/characters/Cursor/**
-!data/characters/Dsh/
-!data/characters/Dsh/**
+!data/characters/Kimi/
+!data/characters/Kimi/**
+!data/characters/README-mascots.md

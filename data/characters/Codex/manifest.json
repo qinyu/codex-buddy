@@ -1,6 +1,5 @@
 {
   "name": "Codex",
-  "mode": "text",
   "colors": {
     "body": "#FFFFFF",
     "bg": "#000000",
@@ -9,13 +8,13 @@
     "ink": "#000000"
   },
   "states": {
-    "sleep": {"delay": 400, "frames": ["C."]},
-    "idle": {"delay": 300, "frames": ["Codex"]},
-    "busy": {"delay": 180, "frames": ["Codex*", "Codex"]},
-    "attention": {"delay": 160, "frames": ["!Codex!", "Codex"]},
-    "completed": {"delay": 220, "frames": ["Codex+", "Codex"]},
-    "celebrate": {"delay": 180, "frames": ["*Codex*", "Codex"]},
-    "dizzy": {"delay": 120, "frames": ["@Codex", "Codex"]},
-    "heart": {"delay": 200, "frames": ["<Codex>", "Codex"]}
+    "sleep": "idle.gif",
+    "idle": "idle.gif",
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "completed": "busy.gif",
+    "celebrate": "busy.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "idle.gif"
   }
 }
