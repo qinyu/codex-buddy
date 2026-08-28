@@ -1,0 +1,4 @@
+{
+  "name": "Codex Buddy",
+  "install": "bash .cursor/install.sh"
+}
