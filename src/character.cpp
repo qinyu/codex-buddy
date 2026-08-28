@@ -496,17 +496,21 @@ void characterTick() {
     if (now < textNext) return;
     textNext = now + ts.delayMs;
 
-    // Clear a band around the text, not the whole sprite — keeps overlays
-    // like the approval panel and the HUD untouched.
-    int cy = peekMode ? 35 : 60;
-    spr.fillRect(0, cy - 14, spr.width(), 28, pal.bg);
-
+    // StickS3 pet peek is ~100px tall / 135 wide — size 2 was unreadably small.
     const char* line = ts.frames[textFrame];
-    int len = strlen(line);
-    int tw = len * 12;                                    // size-2 glyph width
+    int len = (int)strlen(line);
+    if (len < 1) len = 1;
+    int textSize = peekMode ? 4 : 5;
+    while (textSize > 2 && len * 6 * textSize > spr.width() - 4) textSize--;
+    int glyphW = 6 * textSize;
+    int glyphH = 8 * textSize;
+    int cy = peekMode ? (peekTopY + peekClipH / 2) : 60;
+    spr.fillRect(0, cy - glyphH / 2 - 2, spr.width(), glyphH + 4, pal.bg);
+
+    int tw = len * glyphW;
     spr.setTextColor(pal.body, pal.bg);
-    spr.setTextSize(2);
-    spr.setCursor((spr.width() - tw) / 2, cy - 8);
+    spr.setTextSize(textSize);
+    spr.setCursor((spr.width() - tw) / 2, cy - glyphH / 2);
     spr.print(line);
 
     textFrame = (textFrame + 1) % ts.nFrames;
