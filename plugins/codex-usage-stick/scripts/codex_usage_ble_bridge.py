@@ -171,6 +171,10 @@ class UsageSnapshot:
     tertiary_display: str | None = None
     tertiary_resets_at: int | None = None
     meter_count: int | None = None
+    agent: str | None = None
+    agent_id: str | None = None
+    agent_index: int | None = None
+    agent_count: int | None = None
 
     def packet(self, state: str) -> dict[str, Any]:
         now = int(time.time())
@@ -190,7 +194,7 @@ class UsageSnapshot:
         if self.provider:
             packet["provider"] = self.provider
         if self.label:
-            packet["label"] = short_text(self.label, self.provider or "", 15)
+            packet["label"] = provider_display_label(self.label, self.provider or "", 15)
         if self.provider_count is not None and self.provider_count >= 1:
             packet["provider_index"] = self.provider_index or 0
             packet["provider_count"] = self.provider_count
@@ -216,6 +220,13 @@ class UsageSnapshot:
             packet["tertiary_resets_at"] = roll_reset_at(
                 self.tertiary_resets_at, reset_window_sec_for_label(self.tertiary_label), now
             )
+        # Agent Hub chrome (Codex-only defaults until multi-agent hub lands).
+        agent_title = short_text(self.agent or "CODEX", "CODEX", 12)
+        agent_id = short_text(self.agent_id or "codex", "codex", 16)
+        packet["agent"] = agent_title
+        packet["agent_id"] = agent_id
+        packet["agent_index"] = int(self.agent_index if self.agent_index is not None else 0)
+        packet["agent_count"] = int(self.agent_count if self.agent_count is not None else 1)
         return packet
 
 
@@ -1062,6 +1073,10 @@ def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) ->
         tertiary_display=tertiary_bar.display if tertiary_bar and view.meter_count >= 3 else None,
         tertiary_resets_at=tertiary_bar.reset_at if tertiary_bar and view.meter_count >= 3 else None,
         meter_count=view.meter_count,
+        agent="CODEX",
+        agent_id="codex",
+        agent_index=0,
+        agent_count=1,
     )
 
 
@@ -1150,6 +1165,17 @@ def short_text(value: Any, fallback: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "..."
+
+
+def provider_display_label(value: Any, fallback: str = "", limit: int = 15) -> str:
+    """Prefer the full short label; if too long, keep only the first word."""
+    text = str(value or fallback or "USAGE").replace("\n", " ").strip() or "USAGE"
+    if len(text) <= limit:
+        return text
+    word = text.split(None, 1)[0]
+    if len(word) <= limit:
+        return word
+    return word[:limit]
 
 
 class BleSession:

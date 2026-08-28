@@ -28,6 +28,10 @@ struct TamaState {
   uint8_t  codexMeterCount;
   uint8_t  codexProviderIndex;
   uint8_t  codexProviderCount;
+  char     codexAgent[16];
+  char     codexAgentId[16];
+  uint8_t  codexAgentIndex;
+  uint8_t  codexAgentCount;
   char     codexState[16];
   uint32_t lastUpdated;
   char     msg[24];
@@ -240,6 +244,36 @@ static void _applyJson(const char* line, TamaState* out) {
       if (cnt < 0) cnt = 0;
       if (cnt > 255) cnt = 255;
       out->codexProviderCount = (uint8_t)cnt;
+    }
+    const char* agent = doc["agent"];
+    if (agent && *agent) {
+      strncpy(out->codexAgent, agent, sizeof(out->codexAgent) - 1);
+      out->codexAgent[sizeof(out->codexAgent) - 1] = 0;
+    } else if (!out->codexAgent[0]) {
+      strncpy(out->codexAgent, "CODEX", sizeof(out->codexAgent) - 1);
+      out->codexAgent[sizeof(out->codexAgent) - 1] = 0;
+    }
+    const char* agentId = doc["agent_id"];
+    if (agentId && *agentId) {
+      strncpy(out->codexAgentId, agentId, sizeof(out->codexAgentId) - 1);
+      out->codexAgentId[sizeof(out->codexAgentId) - 1] = 0;
+    } else if (!out->codexAgentId[0]) {
+      strncpy(out->codexAgentId, "codex", sizeof(out->codexAgentId) - 1);
+      out->codexAgentId[sizeof(out->codexAgentId) - 1] = 0;
+    }
+    if (doc["agent_index"].is<uint8_t>() || doc["agent_index"].is<int>()) {
+      int idx = doc["agent_index"].as<int>();
+      if (idx < 0) idx = 0;
+      if (idx > 255) idx = 255;
+      out->codexAgentIndex = (uint8_t)idx;
+    }
+    if (doc["agent_count"].is<uint8_t>() || doc["agent_count"].is<int>()) {
+      int cnt = doc["agent_count"].as<int>();
+      if (cnt < 1) cnt = 1;
+      if (cnt > 255) cnt = 255;
+      out->codexAgentCount = (uint8_t)cnt;
+    } else if (out->codexAgentCount < 1) {
+      out->codexAgentCount = 1;
     }
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;

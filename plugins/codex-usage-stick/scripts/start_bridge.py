@@ -30,6 +30,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "restart_delay": 5.0,
     "verbose": True,
     "no_approval_proxy": True,
+    # Usage meters come from OpenCodex provider-quotas; Codex sessions still
+    # feed pet activity + Stick PermissionRequest approval via the same bridge.
+    "opencodex": True,
 }
 
 SHUTDOWN = False
@@ -96,6 +99,16 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
         cmd.append("--verbose")
     if cfg.get("no_approval_proxy", True):
         cmd.append("--no-approval-proxy")
+    if cfg.get("opencodex", True):
+        cmd.append("--opencodex")
+        if cfg.get("opencodex_url"):
+            cmd.extend(["--opencodex-url", str(cfg["opencodex_url"])])
+        if cfg.get("opencodex_token_file"):
+            cmd.extend(["--opencodex-token-file", str(cfg["opencodex_token_file"])])
+        if cfg.get("opencodex_ttl") is not None:
+            cmd.extend(["--opencodex-ttl", str(cfg["opencodex_ttl"])])
+        if cfg.get("opencodex_timeout") is not None:
+            cmd.extend(["--opencodex-timeout", str(cfg["opencodex_timeout"])])
     return cmd
 
 

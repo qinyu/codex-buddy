@@ -189,6 +189,55 @@ class UsageSnapshotPacketTests(unittest.TestCase):
         self.assertEqual(packet["meter_count"], 3)
         self.assertEqual(packet["tertiary_label"], "mo")
 
+    def test_packet_includes_codex_agent_chrome(self) -> None:
+        snap = UsageSnapshot(
+            tokens=0,
+            primary=10,
+            secondary=20,
+            primary_resets_at=0,
+            secondary_resets_at=0,
+            source=__file__,
+            event_ts=None,
+            limit_id="openai",
+            limit_name="OpenAI",
+            provider="openai",
+            label="OpenAI",
+            provider_index=0,
+            provider_count=1,
+            primary_label="mo",
+            meter_count=1,
+        )
+        packet = snap.packet("busy")
+        self.assertEqual(packet["agent"], "CODEX")
+        self.assertEqual(packet["agent_id"], "codex")
+        self.assertEqual(packet["agent_index"], 0)
+        self.assertEqual(packet["agent_count"], 1)
+        self.assertEqual(packet["state"], "busy")
+        self.assertEqual(packet["provider"], "openai")
+        self.assertEqual(packet["provider_index"], 0)
+
+    def test_explicit_agent_chrome_overrides_defaults(self) -> None:
+        snap = UsageSnapshot(
+            tokens=0,
+            primary=0,
+            secondary=0,
+            primary_resets_at=0,
+            secondary_resets_at=0,
+            source=__file__,
+            event_ts=None,
+            limit_id=None,
+            limit_name=None,
+            agent="PI",
+            agent_id="pi",
+            agent_index=2,
+            agent_count=5,
+        )
+        packet = snap.packet("idle")
+        self.assertEqual(packet["agent"], "PI")
+        self.assertEqual(packet["agent_id"], "pi")
+        self.assertEqual(packet["agent_index"], 2)
+        self.assertEqual(packet["agent_count"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

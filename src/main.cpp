@@ -1146,8 +1146,29 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
   }
 }
 
-static const char* usageHeaderTitle() {
-  return tama.codexProviderLabel[0] ? tama.codexProviderLabel : "USAGE";
+static const char* usageTopTitle() {
+  return tama.codexAgent[0] ? tama.codexAgent : "CODEX";
+}
+
+// Long provider titles collapse to the first whitespace-delimited word.
+static const char* usageProviderTitle() {
+  static char title[16];
+  const char* src = tama.codexProviderLabel[0] ? tama.codexProviderLabel : "USAGE";
+  size_t len = strlen(src);
+  if (len <= 12) return src;
+
+  size_t n = 0;
+  while (src[n] && src[n] != ' ' && src[n] != '\t' && n + 1 < sizeof(title)) {
+    title[n] = src[n];
+    n++;
+  }
+  if (n == 0) {
+    strncpy(title, "USAGE", sizeof(title) - 1);
+    title[sizeof(title) - 1] = 0;
+  } else {
+    title[n] = 0;
+  }
+  return title;
 }
 
 static const char* usagePrimaryWindowLabel() {
@@ -1261,6 +1282,50 @@ static void drawUsageMeterZone(lgfx::v1::LGFXBase* dst, int x, int w, bool live,
   }
 }
 
+static const char* usagePersonaLabel(PersonaState s) {
+  switch (s) {
+    case P_BUSY:      return "BUSY";
+    case P_ATTENTION: return "ATTN";
+    case P_COMPLETED: return "DONE";
+    case P_DIZZY:     return "DIZZY";
+    case P_HEART:     return "HEART";
+    case P_SLEEP:     return "SLEEP";
+    case P_IDLE:
+    default:          return "IDLE";
+  }
+}
+
+static uint16_t usagePersonaColor(PersonaState s, const Palette& p) {
+  switch (s) {
+    case P_BUSY:      return HOT;
+    case P_ATTENTION: return HOT;
+    case P_COMPLETED: return GREEN;
+    case P_DIZZY:     return HOT;
+    case P_HEART:     return HOT;
+    case P_SLEEP:     return p.textDim;
+    case P_IDLE:
+    default:          return p.text;
+  }
+}
+
+// Provider title + page sit above the meter rows (portrait gap / landscape above block).
+static void drawUsageProviderHeader(lgfx::v1::LGFXBase* dst, int x, int w, int y,
+                                    bool live, const Palette& p) {
+  dst->fillRect(x, y, w, 12, p.bg);
+  dst->setTextSize(1);
+  dst->setTextDatum(TL_DATUM);
+  dst->setTextColor(live ? p.text : p.textDim, p.bg);
+  dst->drawString(usageProviderTitle(), x, y);
+  if (tama.codexProviderCount > 1) {
+    char page[8];
+    snprintf(page, sizeof(page), "%u/%u",
+             tama.codexProviderIndex + 1, tama.codexProviderCount);
+    dst->setTextDatum(TR_DATUM);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString(page, x + w, y);
+  }
+}
+
 static void drawUsageDashboard() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
@@ -1268,20 +1333,23 @@ static void drawUsageDashboard() {
   static uint8_t cachedProvIdx = 0xFF;
   static uint8_t cachedProvCnt = 0xFF;
   static uint8_t cachedMeterCount = 0xFF;
+  static uint8_t cachedPersona = 0xFF;
 
   if (!usageLiveKnown || usageLastLive != live
-      || strncmp(cachedUsageLabel, usageHeaderTitle(), sizeof(cachedUsageLabel)) != 0
+      || strncmp(cachedUsageLabel, usageProviderTitle(), sizeof(cachedUsageLabel)) != 0
       || cachedProvIdx != tama.codexProviderIndex
       || cachedProvCnt != tama.codexProviderCount
-      || cachedMeterCount != tama.codexMeterCount) {
+      || cachedMeterCount != tama.codexMeterCount
+      || cachedPersona != (uint8_t)activeState) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
-    strncpy(cachedUsageLabel, usageHeaderTitle(), sizeof(cachedUsageLabel) - 1);
+    strncpy(cachedUsageLabel, usageProviderTitle(), sizeof(cachedUsageLabel) - 1);
     cachedUsageLabel[sizeof(cachedUsageLabel) - 1] = 0;
     cachedProvIdx = tama.codexProviderIndex;
     cachedProvCnt = tama.codexProviderCount;
     cachedMeterCount = tama.codexMeterCount;
+    cachedPersona = (uint8_t)activeState;
   }
 
   spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
@@ -1303,21 +1371,16 @@ static void drawUsageDashboard() {
     spr.setTextSize(1);
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(p.textDim, p.bg);
-    spr.drawString(usageHeaderTitle(), 8, 8);
+    spr.drawString(usageTopTitle(), 8, 4);
+    spr.setTextColor(usagePersonaColor(activeState, p), p.bg);
+    spr.drawString(usagePersonaLabel(activeState), 8, 14);
     spr.setTextDatum(TR_DATUM);
-    if (tama.codexProviderCount > 1) {
-      char page[8];
-      snprintf(page, sizeof(page), "%u/%u", tama.codexProviderIndex + 1, tama.codexProviderCount);
-      spr.setTextColor(p.textDim, p.bg);
-      spr.drawString(page, W - 8, 8);
-      spr.setTextColor(live ? GREEN : HOT, p.bg);
-      spr.drawString(live ? "LIVE" : "WAIT", W - 8, 18);
-    } else {
-      spr.setTextColor(live ? GREEN : HOT, p.bg);
-      spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
-    }
+    spr.setTextColor(live ? GREEN : HOT, p.bg);
+    spr.drawString(live ? "LIVE" : "WAIT", W - 8, 14);
   }
 
+  // Usage block: provider name + page, then meter rows.
+  drawUsageProviderHeader(&spr, 8, W - 16, USAGE_PET_BOTTOM + 2, live, p);
   drawUsageMeterZone(&spr, 8, W - 16, live, p,
                      USAGE_ROW1_Y, USAGE_ROW2_Y, USAGE_ROW3_Y, USAGE_ROW2_Y, H - USAGE_ROW2_Y);
 
@@ -1331,18 +1394,21 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedProvIdxLand = 0xFF;
   static uint8_t cachedProvCntLand = 0xFF;
   static char cachedUsageLabelLand[16] = "";
+  static uint8_t cachedPersonaLand = 0xFF;
 
   if (!usageLiveKnown || usageLastLive != live
-      || strncmp(cachedUsageLabelLand, usageHeaderTitle(), sizeof(cachedUsageLabelLand)) != 0
+      || strncmp(cachedUsageLabelLand, usageProviderTitle(), sizeof(cachedUsageLabelLand)) != 0
       || cachedProvIdxLand != tama.codexProviderIndex
-      || cachedProvCntLand != tama.codexProviderCount) {
+      || cachedProvCntLand != tama.codexProviderCount
+      || cachedPersonaLand != (uint8_t)activeState) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
-    strncpy(cachedUsageLabelLand, usageHeaderTitle(), sizeof(cachedUsageLabelLand) - 1);
+    strncpy(cachedUsageLabelLand, usageProviderTitle(), sizeof(cachedUsageLabelLand) - 1);
     cachedUsageLabelLand[sizeof(cachedUsageLabelLand) - 1] = 0;
     cachedProvIdxLand = tama.codexProviderIndex;
     cachedProvCntLand = tama.codexProviderCount;
+    cachedPersonaLand = (uint8_t)activeState;
   }
 
   M5.Lcd.setRotation(clockOrient);
@@ -1355,9 +1421,11 @@ static void drawUsageDashboardLandscape() {
   const int landSlotH = USAGE_SLOT_H;
   const int landRows = (!tama.connected || tama.codexMeterCount >= 3) ? 3
                       : (tama.codexMeterCount >= 2) ? 2 : 1;
-  const int landBlockH = landRows * landSlotH;
+  const int landProvH = 12;
+  const int landBlockH = landProvH + landRows * landSlotH;
   const int landBottomPad = 4;
-  const int landRow1Y = lh - landBottomPad - landBlockH;
+  const int landProvY = lh - landBottomPad - landBlockH;
+  const int landRow1Y = landProvY + landProvH;
   const int landRow2Y = landRow1Y + landSlotH;
   const int landRow3Y = landRow2Y + landSlotH;
 
@@ -1379,23 +1447,17 @@ static void drawUsageDashboardLandscape() {
     M5.Lcd.setTextSize(1);
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextColor(p.textDim, p.bg);
-    M5.Lcd.drawString(usageHeaderTitle(), rightX, 7);
+    M5.Lcd.drawString(usageTopTitle(), rightX, 4);
+    M5.Lcd.setTextColor(usagePersonaColor(activeState, p), p.bg);
+    M5.Lcd.drawString(usagePersonaLabel(activeState), rightX, 14);
     M5.Lcd.setTextDatum(TR_DATUM);
-    if (tama.codexProviderCount > 1) {
-      char page[8];
-      snprintf(page, sizeof(page), "%u/%u", tama.codexProviderIndex + 1, tama.codexProviderCount);
-      M5.Lcd.setTextColor(p.textDim, p.bg);
-      M5.Lcd.drawString(page, lw - 8, 7);
-      M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-      M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 17);
-    } else {
-      M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-      M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
-    }
+    M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
+    M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 14);
     cachedLive = live;
     cachedOrient = clockOrient;
   }
 
+  drawUsageProviderHeader(&M5.Lcd, rightX, rightW, landProvY, live, p);
   drawUsageMeterZone(&M5.Lcd, rightX, rightW, live, p,
                      landRow1Y, landRow2Y, landRow3Y, landRow2Y, lh - landRow2Y);
 
