@@ -1151,10 +1151,13 @@ static const char* usageTopTitle() {
 }
 
 static const char* packNameForAgentId(const char* agentId) {
-  // Stick pet art is the Mao GIF pack (color pixel animation).
-  // Ping Island Assets.car only ships static Logos (CodexLogo/PiLogo/…), not
-  // Stick-sized GIF state packs — map all agents to Mao until real packs exist.
-  (void)agentId;
+  // Ping Island MascotView exports (idle/working/warning/dragging).
+  if (!agentId || !*agentId) return "Mao";
+  if (strcmp(agentId, "codex") == 0) return "Codex";
+  if (strcmp(agentId, "pi") == 0) return "Pi";
+  if (strcmp(agentId, "hermes") == 0) return "Hermes";
+  if (strcmp(agentId, "cursor") == 0) return "Cursor";
+  // dsh / claude / gemini / unknown: Mao until a Stick pack is shipped.
   return "Mao";
 }
 

@@ -1,0 +1,20 @@
+{
+  "name": "Cursor",
+  "colors": {
+    "body": "#FFFFFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "textDim": "#808080",
+    "ink": "#000000"
+  },
+  "states": {
+    "sleep": "idle.gif",
+    "idle": "idle.gif",
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "completed": "busy.gif",
+    "celebrate": "busy.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "idle.gif"
+  }
+}
