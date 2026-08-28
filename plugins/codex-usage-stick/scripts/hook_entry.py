@@ -25,6 +25,7 @@ START_BRIDGE = PLUGIN_ROOT / "scripts" / "start_bridge.py"
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 HOOK_LOG_PATH = STATE_DIR / "hook.log"
 APPROVAL_SOCK_PATH = STATE_DIR / "approval.sock"
+AGENT_HUB_SOCK_PATH = STATE_DIR / "agent-hub.sock"
 APPROVAL_WAIT_SEC = 45.0
 APPROVAL_CONNECT_SEC = 4.0
 
@@ -138,6 +139,39 @@ def request_hardware_permission(hook_payload: dict[str, Any]) -> dict[str, Any] 
             return None
 
 
+def notify_agent_hub(event: str, stdin_text: str) -> None:
+    """Best-effort dual-send of Codex hooks into the Stick Agent Hub socket."""
+    try:
+        hook = json.loads(stdin_text) if stdin_text else {}
+        if not isinstance(hook, dict):
+            hook = {}
+    except json.JSONDecodeError:
+        hook = {}
+    envelope = {
+        "source": "codex",
+        "client_kind": "codex",
+        "client_name": "CODEX",
+        "hook_event_name": hook.get("hook_event_name") or event,
+    }
+    envelope.update(hook)
+    encoded = (json.dumps(envelope, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.8)
+            sock.connect(str(AGENT_HUB_SOCK_PATH))
+            sock.sendall(encoded)
+            sock.makefile("rb").readline(4096)
+        append_log({"time": now_iso(), "event": event, "phase": "agent_hub_ok"})
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
+        append_log({
+            "time": now_iso(),
+            "event": event,
+            "phase": "agent_hub_skip",
+            "socket": str(AGENT_HUB_SOCK_PATH),
+            "error": repr(exc),
+        })
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Codex Usage Stick hook entry point.")
     parser.add_argument("--event", default="unknown", help="Hook event name")
@@ -179,6 +213,8 @@ def main() -> int:
             "phase": "error",
             "error": repr(exc),
         })
+
+    notify_agent_hub(args.event, stdin_text)
 
     if args.event == "PermissionRequest":
         try:

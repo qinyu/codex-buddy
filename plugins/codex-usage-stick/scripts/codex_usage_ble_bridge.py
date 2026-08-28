@@ -141,6 +141,349 @@ class ActivityTracker:
         return "idle"
 
 
+FIRST_CLASS_AGENT_IDS: tuple[str, ...] = ("codex", "pi", "hermes", "cursor", "dsh")
+
+AGENT_TITLES: dict[str, str] = {
+    "codex": "CODEX",
+    "pi": "PI",
+    "hermes": "HERMES",
+    "cursor": "CURSOR",
+    "dsh": "DSH",
+}
+
+
+def normalize_agent_id(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-")
+    return text or None
+
+
+def resolve_agent_id(payload: dict[str, Any]) -> str:
+    """Map Ping Island-shaped identity metadata onto a stable agent id."""
+    for key in ("client_kind", "agent_id", "client_originator"):
+        aid = normalize_agent_id(payload.get(key))
+        if aid in FIRST_CLASS_AGENT_IDS:
+            return aid
+        if aid:
+            for known in FIRST_CLASS_AGENT_IDS:
+                if known in aid or aid in known:
+                    return known
+
+    for key in ("client_name", "thread_source"):
+        raw = str(payload.get(key) or "").strip().lower()
+        for known in FIRST_CLASS_AGENT_IDS:
+            if known in raw:
+                return known
+
+    source = normalize_agent_id(payload.get("source"))
+    if source == "codex":
+        return "codex"
+    if source in FIRST_CLASS_AGENT_IDS:
+        return source
+    if source:
+        return source
+    return "codex"
+
+
+def agent_title_for(agent_id: str, payload: dict[str, Any] | None = None) -> str:
+    if agent_id in AGENT_TITLES:
+        return AGENT_TITLES[agent_id]
+    if payload:
+        for key in ("client_name", "client_originator", "agent"):
+            name = str(payload.get(key) or "").strip()
+            if name:
+                return short_text(name.upper(), agent_id.upper(), 12)
+    return short_text(agent_id.upper(), "AGENT", 12)
+
+
+def hook_event_name(payload: dict[str, Any]) -> str:
+    for key in ("hook_event_name", "event", "event_name", "type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = payload.get("hook")
+    if isinstance(nested, dict):
+        return hook_event_name(nested)
+    return ""
+
+
+def state_from_hook_event(event_name: str) -> str | None:
+    key = re.sub(r"[^a-z]", "", event_name.strip().lower())
+    if not key:
+        return None
+    if key in {"permissionrequest"}:
+        return "attention"
+    if key in {"userpromptsubmit", "pretooluse", "posttooluse", "notification", "precompact", "postcompact"}:
+        return "busy"
+    if key in {"sessionend"}:
+        return "completed"
+    if key in {"stop", "sessionstart"}:
+        return "idle"
+    return None
+
+
+def flatten_hook_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Accept tee/dual-send envelopes and flatten identity + event fields."""
+    flat = dict(payload)
+    nested = payload.get("hook")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            flat.setdefault(key, value)
+    inner = payload.get("payload")
+    if isinstance(inner, dict):
+        for key, value in inner.items():
+            flat.setdefault(key, value)
+    return flat
+
+
+@dataclass
+class HubAgent:
+    agent_id: str
+    title: str
+    state: str = "idle"
+    last_event_at: float = 0.0
+    last_busy_at: float | None = None
+    last_attention_at: float | None = None
+    last_completed_at: float | None = None
+    session_id: str | None = None
+    from_hook: bool = False
+
+
+class AgentHub:
+    """Multi-agent roster fed by Ping Island-shaped hook events."""
+
+    def __init__(
+        self,
+        *,
+        busy_window: float = 60.0,
+        attention_window: float = 120.0,
+        completed_window: float = 25.0,
+        sleep_window: float = 20 * 60.0,
+        recent_window: float = 45 * 60.0,
+        rotate_idle_sec: float = 12.0,
+        rotate_busy_sec: float = 28.0,
+        manual_grace_sec: float = 45.0,
+    ) -> None:
+        self.busy_window = busy_window
+        self.attention_window = attention_window
+        self.completed_window = completed_window
+        self.sleep_window = sleep_window
+        self.recent_window = recent_window
+        self.rotate_idle_sec = rotate_idle_sec
+        self.rotate_busy_sec = rotate_busy_sec
+        self.manual_grace_sec = manual_grace_sec
+        self.agents: dict[str, HubAgent] = {}
+        self.order: list[str] = []
+        self.current_id: str | None = None
+        self.manual_grace_until = 0.0
+        self._rotate_started_at = time.time()
+        self._ipc_server: asyncio.AbstractServer | None = None
+
+    def ensure_agent(self, agent_id: str, payload: dict[str, Any] | None = None) -> HubAgent:
+        aid = normalize_agent_id(agent_id) or "codex"
+        if aid not in self.agents:
+            self.agents[aid] = HubAgent(agent_id=aid, title=agent_title_for(aid, payload))
+            self.order.append(aid)
+            if self.current_id is None:
+                self.current_id = aid
+                self._rotate_started_at = time.time()
+        elif payload:
+            self.agents[aid].title = agent_title_for(aid, payload)
+        return self.agents[aid]
+
+    def ingest_hook(self, payload: dict[str, Any], now: float | None = None) -> HubAgent:
+        flat = flatten_hook_payload(payload)
+        now = time.time() if now is None else now
+        agent_id = resolve_agent_id(flat)
+        agent = self.ensure_agent(agent_id, flat)
+        agent.from_hook = True
+        agent.last_event_at = now
+        session = flat.get("session_id")
+        if isinstance(session, str) and session.strip():
+            agent.session_id = session.strip()
+
+        mapped = state_from_hook_event(hook_event_name(flat))
+        if mapped == "attention":
+            agent.state = "attention"
+            agent.last_attention_at = now
+            agent.last_busy_at = now
+        elif mapped == "busy":
+            agent.state = "busy"
+            agent.last_busy_at = now
+        elif mapped == "completed":
+            agent.state = "completed"
+            agent.last_completed_at = now
+            agent.last_busy_at = None
+        elif mapped == "idle":
+            agent.state = "idle"
+            agent.last_busy_at = None
+        # Unknown events still refresh last_event_at so the agent stays in the roster.
+        return agent
+
+    def note_codex_fallback(self, state: str, now: float | None = None) -> HubAgent:
+        """Keep Codex visible from rollout/OpenCodex activity when hooks are quiet."""
+        now = time.time() if now is None else now
+        agent = self.ensure_agent("codex")
+        if agent.from_hook and is_recent(agent.last_event_at, self.busy_window, now):
+            return agent
+        agent.last_event_at = max(agent.last_event_at, now)
+        agent.state = state
+        if state in {"busy", "attention"}:
+            agent.last_busy_at = now
+            if state == "attention":
+                agent.last_attention_at = now
+        elif state == "completed":
+            agent.last_completed_at = now
+        return agent
+
+    def tick(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for agent in self.agents.values():
+            if agent.state == "attention":
+                if not is_recent(agent.last_attention_at, self.attention_window, now):
+                    agent.state = "busy" if is_recent(agent.last_busy_at, self.busy_window, now) else "idle"
+            if agent.state == "busy" and not is_recent(agent.last_busy_at, self.busy_window, now):
+                agent.state = "idle"
+            if agent.state == "completed" and not is_recent(agent.last_completed_at, self.completed_window, now):
+                agent.state = "idle"
+            if agent.state == "idle" and agent.last_event_at and now - agent.last_event_at >= self.sleep_window:
+                agent.state = "sleep"
+
+    def visible_ids(self, now: float | None = None) -> list[str]:
+        now = time.time() if now is None else now
+        visible = [
+            aid
+            for aid in self.order
+            if aid in self.agents and is_recent(self.agents[aid].last_event_at, self.recent_window, now)
+        ]
+        if not visible and self.order:
+            # Always keep at least the current/first agent so chrome stays valid.
+            cur = self.current_id if self.current_id in self.agents else self.order[0]
+            return [cur]
+        return visible
+
+    def current(self, now: float | None = None) -> HubAgent | None:
+        visible = self.visible_ids(now)
+        if not visible:
+            return None
+        if self.current_id not in visible:
+            self.current_id = visible[0]
+            self._rotate_started_at = time.time() if now is None else now
+        return self.agents[self.current_id]
+
+    def current_index(self, now: float | None = None) -> int:
+        visible = self.visible_ids(now)
+        if not visible or self.current_id not in visible:
+            return 0
+        return visible.index(self.current_id)
+
+    def advance(self, action: str = "next", index: int | None = None, now: float | None = None) -> HubAgent | None:
+        now = time.time() if now is None else now
+        visible = self.visible_ids(now)
+        if not visible:
+            return None
+        if index is not None:
+            self.current_id = visible[max(0, min(index, len(visible) - 1))]
+        elif action == "prev":
+            cur = self.current_index(now)
+            self.current_id = visible[(cur - 1) % len(visible)]
+        else:
+            cur = self.current_index(now)
+            self.current_id = visible[(cur + 1) % len(visible)]
+        self.manual_grace_until = now + self.manual_grace_sec
+        self._rotate_started_at = now
+        return self.agents.get(self.current_id) if self.current_id else None
+
+    def maybe_auto_rotate(self, now: float | None = None) -> HubAgent | None:
+        now = time.time() if now is None else now
+        visible = self.visible_ids(now)
+        if len(visible) <= 1:
+            return self.current(now)
+        if now < self.manual_grace_until:
+            return self.current(now)
+        current = self.current(now)
+        if not current:
+            return None
+        dwell = self.rotate_busy_sec if current.state in {"busy", "attention"} else self.rotate_idle_sec
+        if now - self._rotate_started_at < dwell:
+            return current
+        # Prefer next busy/attention agent when available.
+        start = self.current_index(now)
+        for offset in range(1, len(visible) + 1):
+            candidate_id = visible[(start + offset) % len(visible)]
+            candidate = self.agents[candidate_id]
+            if candidate.state in {"busy", "attention"} or offset == len(visible):
+                self.current_id = candidate_id
+                self._rotate_started_at = now
+                break
+        return self.current(now)
+
+    def apply_to_snapshot(self, snapshot: UsageSnapshot, now: float | None = None) -> str | None:
+        self.tick(now)
+        agent = self.current(now)
+        if not agent:
+            return None
+        visible = self.visible_ids(now)
+        snapshot.agent = agent.title
+        snapshot.agent_id = agent.agent_id
+        snapshot.agent_index = self.current_index(now)
+        snapshot.agent_count = len(visible)
+        return agent.state
+
+    async def start_ipc_server(self, sock: Path, verbose: bool = False) -> None:
+        sock = sock.expanduser()
+        sock.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            sock.unlink()
+        self._ipc_server = await asyncio.start_unix_server(
+            self._handle_ipc_client,
+            path=str(sock),
+        )
+        with contextlib.suppress(OSError):
+            sock.chmod(0o600)
+        if verbose:
+            print(f"[agent-hub] hook IPC listening at {sock}", file=sys.stderr)
+
+    async def close_ipc_server(self, sock: Path | None = None) -> None:
+        if self._ipc_server:
+            self._ipc_server.close()
+            await self._ipc_server.wait_closed()
+            self._ipc_server = None
+        if sock:
+            with contextlib.suppress(FileNotFoundError):
+                sock.expanduser().unlink()
+
+    async def _handle_ipc_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        response: dict[str, Any]
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            request = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(request, dict):
+                response = {"ok": False, "reason": "expected object"}
+            else:
+                agent = self.ingest_hook(request)
+                response = {
+                    "ok": True,
+                    "agent_id": agent.agent_id,
+                    "state": agent.state,
+                    "agent_count": len(self.visible_ids()),
+                }
+        except Exception as exc:
+            response = {"ok": False, "reason": repr(exc)}
+        writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
 @dataclass
 class UsageSnapshot:
     tokens: int
@@ -220,7 +563,7 @@ class UsageSnapshot:
             packet["tertiary_resets_at"] = roll_reset_at(
                 self.tertiary_resets_at, reset_window_sec_for_label(self.tertiary_label), now
             )
-        # Agent Hub chrome (Codex-only defaults until multi-agent hub lands).
+        # Agent Hub chrome (defaults; AgentHub.apply_to_snapshot overrides when active).
         agent_title = short_text(self.agent or "CODEX", "CODEX", 12)
         agent_id = short_text(self.agent_id or "codex", "codex", 16)
         packet["agent"] = agent_title
@@ -1681,6 +2024,7 @@ async def send_usage_update(
     approvals: CodexApprovalProxy | None = None,
     opencodex: OpenCodexProviders | None = None,
     force_refresh: bool = False,
+    hub: AgentHub | None = None,
 ) -> None:
     if approvals and approvals.has_pending():
         return
@@ -1695,6 +2039,12 @@ async def send_usage_update(
         return
 
     state = choose_state(args, snapshot, tracker)
+    if hub is not None:
+        hub.note_codex_fallback(state)
+        hub.maybe_auto_rotate()
+        hub_state = hub.apply_to_snapshot(snapshot)
+        if hub_state:
+            state = hub_state
     packet = snapshot.packet(state)
     line = json.dumps(packet, separators=(",", ":"))
 
@@ -1717,12 +2067,28 @@ async def bridge_loop(args: argparse.Namespace) -> None:
     setattr(find_device, "debug_scan", args.debug_scan)
     tracker = ActivityTracker()
     opencodex = OpenCodexProviders(args) if args.opencodex else None
+    hub = AgentHub(
+        busy_window=args.busy_window,
+        attention_window=args.attention_window,
+        completed_window=args.completed_window,
+        sleep_window=args.sleep_window,
+        recent_window=args.agent_recent_window,
+        rotate_idle_sec=args.agent_rotate_idle,
+        rotate_busy_sec=args.agent_rotate_busy,
+        manual_grace_sec=args.agent_manual_grace,
+    )
     if args.dry_run:
-        while True:
-            await send_usage_update(args, tracker, opencodex=opencodex)
-            if args.once:
-                return
-            await asyncio.sleep(args.interval)
+        if args.agent_hub_sock:
+            await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
+        try:
+            while True:
+                await send_usage_update(args, tracker, opencodex=opencodex, hub=hub)
+                if args.once:
+                    return
+                await asyncio.sleep(args.interval)
+        finally:
+            await hub.close_ipc_server(args.agent_hub_sock)
+        return
 
     assert BleakClient is not None
     dev = await find_device(args.name, args.address, args.scan_timeout)
@@ -1738,12 +2104,14 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         approvals = CodexApprovalProxy(args, ble)
         await approvals.start_ipc_server()
         await approvals.start()
+        if args.agent_hub_sock:
+            await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
         if args.test_approval:
             await approvals.inject_test_request()
 
         async def usage_runner() -> None:
             while True:
-                await send_usage_update(args, tracker, ble, approvals, opencodex)
+                await send_usage_update(args, tracker, ble, approvals, opencodex, hub=hub)
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -1770,6 +2138,28 @@ async def bridge_loop(args: argparse.Namespace) -> None:
                         approvals,
                         opencodex,
                         force_refresh=True,
+                        hub=hub,
+                    )
+                    continue
+                if msg.get("cmd") == "agent":
+                    action = str(msg.get("action") or "next")
+                    index = msg.get("index")
+                    parsed_index = int(index) if isinstance(index, int) else None
+                    selected = hub.advance(action, parsed_index)
+                    if args.verbose and selected:
+                        print(
+                            f"[agent] {action} -> {selected.title} "
+                            f"({hub.current_index() + 1}/{len(hub.visible_ids())})",
+                            file=sys.stderr,
+                        )
+                    await send_usage_update(
+                        args,
+                        tracker,
+                        ble,
+                        approvals,
+                        opencodex,
+                        force_refresh=True,
+                        hub=hub,
                     )
                     continue
                 await approvals.handle_device_message(msg)
@@ -1781,6 +2171,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
             await asyncio.gather(usage_runner(), device_runner())
         finally:
             await approvals.close_ipc_server()
+            await hub.close_ipc_server(args.agent_hub_sock)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1884,6 +2275,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--attention-window", type=float, default=120.0)
     p.add_argument("--dizzy-window", type=float, default=60.0)
     p.add_argument("--sleep-window", type=float, default=20 * 60.0)
+    p.add_argument(
+        "--agent-hub-sock",
+        type=Path,
+        default=None,
+        help="Unix socket for Ping Island-shaped Agent Hub hook events (line-delimited JSON)",
+    )
+    p.add_argument(
+        "--agent-recent-window",
+        type=float,
+        default=45 * 60.0,
+        help="Seconds an agent stays in the carousel after last event",
+    )
+    p.add_argument("--agent-rotate-idle", type=float, default=12.0)
+    p.add_argument("--agent-rotate-busy", type=float, default=28.0)
+    p.add_argument("--agent-manual-grace", type=float, default=45.0)
     return p
 
 
@@ -1896,6 +2302,8 @@ def main() -> int:
         args.approval_sock = args.approval_sock.expanduser()
     if args.hook_approval_sock:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
+    if args.agent_hub_sock:
+        args.agent_hub_sock = args.agent_hub_sock.expanduser()
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
     if args.opencodex_token_file:

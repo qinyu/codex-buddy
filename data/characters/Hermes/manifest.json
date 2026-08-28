@@ -1,0 +1,21 @@
+{
+  "name": "Hermes",
+  "mode": "text",
+  "colors": {
+    "body": "#FFFFFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "textDim": "#808080",
+    "ink": "#000000"
+  },
+  "states": {
+    "sleep": {"delay": 400, "frames": ["H."]},
+    "idle": {"delay": 300, "frames": ["Hermes"]},
+    "busy": {"delay": 180, "frames": ["Hermes*", "Hermes"]},
+    "attention": {"delay": 160, "frames": ["!Hermes!", "Hermes"]},
+    "completed": {"delay": 220, "frames": ["Hermes+", "Hermes"]},
+    "celebrate": {"delay": 180, "frames": ["*Hermes*", "Hermes"]},
+    "dizzy": {"delay": 120, "frames": ["@Hermes", "Hermes"]},
+    "heart": {"delay": 200, "frames": ["<Hermes>", "Hermes"]}
+  }
+}

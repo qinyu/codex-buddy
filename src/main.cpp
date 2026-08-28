@@ -1150,6 +1150,25 @@ static const char* usageTopTitle() {
   return tama.codexAgent[0] ? tama.codexAgent : "CODEX";
 }
 
+static const char* packNameForAgentId(const char* agentId) {
+  if (!agentId || !*agentId) return "Mao";
+  if (strcmp(agentId, "codex") == 0) return "Codex";
+  if (strcmp(agentId, "pi") == 0) return "Pi";
+  if (strcmp(agentId, "hermes") == 0) return "Hermes";
+  if (strcmp(agentId, "cursor") == 0) return "Cursor";
+  if (strcmp(agentId, "dsh") == 0) return "Dsh";
+  return agentId;
+}
+
+static void ensureAgentCharacterPack() {
+  static char lastAgentId[16] = "";
+  const char* aid = tama.codexAgentId[0] ? tama.codexAgentId : "codex";
+  if (strcmp(lastAgentId, aid) == 0) return;
+  strncpy(lastAgentId, aid, sizeof(lastAgentId) - 1);
+  lastAgentId[sizeof(lastAgentId) - 1] = 0;
+  characterSelect(packNameForAgentId(aid), "Mao");
+}
+
 // Long provider titles collapse to the first whitespace-delimited word.
 static const char* usageProviderTitle() {
   static char title[16];
@@ -1327,6 +1346,7 @@ static void drawUsageProviderHeader(lgfx::v1::LGFXBase* dst, int x, int w, int y
 }
 
 static void drawUsageDashboard() {
+  ensureAgentCharacterPack();
   const Palette& p = characterPalette();
   bool live = tama.connected;
   static char cachedUsageLabel[16] = "";
@@ -1388,6 +1408,7 @@ static void drawUsageDashboard() {
 }
 
 static void drawUsageDashboardLandscape() {
+  ensureAgentCharacterPack();
   const Palette& p = characterPalette();
   bool live = tama.connected;
 
@@ -1701,15 +1722,21 @@ void loop() {
 
   if (btnAStablePress && M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
-    beep(800, 60);
-    if (resetOpen) { resetOpen = false; }
-    else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
-    else {
-      menuOpen = !menuOpen;
-      menuSel = 0;
-      if (!menuOpen) characterInvalidate();
+    if (!inPrompt && !resetOpen && !settingsOpen && !menuOpen
+        && displayMode == DISP_NORMAL && tama.codexAgentCount > 1) {
+      beep(1800, 30);
+      sendCmd("{\"cmd\":\"agent\",\"action\":\"prev\"}");
+    } else {
+      beep(800, 60);
+      if (resetOpen) { resetOpen = false; }
+      else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
+      else {
+        menuOpen = !menuOpen;
+        menuSel = 0;
+        if (!menuOpen) characterInvalidate();
+      }
+      Serial.println(menuOpen ? "menu open" : "menu close");
     }
-    Serial.println(menuOpen ? "menu open" : "menu close");
   }
   if (M5.BtnA.wasReleased()) {
     if (btnAStablePress && !btnALong && !swallowBtnA) {
@@ -1732,6 +1759,9 @@ void loop() {
       } else if (menuOpen) {
         beep(1800, 30);
         menuSel = (menuSel + 1) % MENU_N;
+      } else if (displayMode == DISP_NORMAL && tama.codexAgentCount > 1) {
+        beep(2400, 30);
+        sendCmd("{\"cmd\":\"agent\",\"action\":\"next\"}");
       } else {
         beep(1800, 30);
         displayMode = (displayMode == DISP_NORMAL) ? DISP_INFO : DISP_NORMAL;

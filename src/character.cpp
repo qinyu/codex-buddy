@@ -33,6 +33,7 @@ static uint32_t  textNext = 0;
 static bool    loaded = false;
 static Palette pal = { 0xC2A6, 0x0000, 0xFFFF, 0x8410, 0x0000 };
 static char    basePath[48];
+static char    currentPackName[24] = "";
 static const uint8_t MAX_GIFS = 32;
 static char    gifPaths[MAX_GIFS][32];
 static uint8_t stateStart[N_STATES];
@@ -239,6 +240,8 @@ bool characterInit(const char* name) {
       }
     }
     loaded = true;
+    strncpy(currentPackName, name, sizeof(currentPackName) - 1);
+    currentPackName[sizeof(currentPackName) - 1] = 0;
     Serial.printf("[char] loaded '%s' (text mode, %d states)\n", name, N_STATES);
     return true;
   }
@@ -263,11 +266,33 @@ bool characterInit(const char* name) {
 
   gif.begin(LITTLE_ENDIAN_PIXELS);
   loaded = true;
-  Serial.printf("[char] loaded '%s' from %s\n", (const char*)doc["name"], basePath);
+  {
+    const char* shown = doc["name"] | name;
+    strncpy(currentPackName, name, sizeof(currentPackName) - 1);
+    currentPackName[sizeof(currentPackName) - 1] = 0;
+    Serial.printf("[char] loaded '%s' from %s\n", shown, basePath);
+  }
   return true;
 }
 
 bool characterLoaded() { return loaded; }
+const char* characterCurrentName() { return currentPackName; }
+
+bool characterSelect(const char* name, const char* fallbackName) {
+  if (!name || !*name) name = fallbackName;
+  if (!name || !*name) name = "Mao";
+  if (loaded && strcmp(currentPackName, name) == 0) return true;
+  characterClose();
+  if (characterInit(name)) return true;
+  if (fallbackName && *fallbackName && strcmp(fallbackName, name) != 0) {
+    if (characterInit(fallbackName)) return true;
+  }
+  if (strcmp(name, "Mao") != 0 && (!fallbackName || strcmp(fallbackName, "Mao") != 0)) {
+    return characterInit("Mao");
+  }
+  return false;
+}
+
 const Palette& characterPalette() { return pal; }
 
 // One-shot half-scale render to an arbitrary surface (M5.Lcd for the

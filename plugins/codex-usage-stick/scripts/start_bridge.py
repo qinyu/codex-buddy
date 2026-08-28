@@ -33,6 +33,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Usage meters come from OpenCodex provider-quotas; Codex sessions still
     # feed pet activity + Stick PermissionRequest approval via the same bridge.
     "opencodex": True,
+    # Ping Island-shaped hooks tee into this unix socket for Agent Hub.
+    "agent_hub_sock": str(STATE_DIR / "agent-hub.sock"),
 }
 
 SHUTDOWN = False
@@ -109,6 +111,9 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
             cmd.extend(["--opencodex-ttl", str(cfg["opencodex_ttl"])])
         if cfg.get("opencodex_timeout") is not None:
             cmd.extend(["--opencodex-timeout", str(cfg["opencodex_timeout"])])
+    hub_sock = cfg.get("agent_hub_sock")
+    if hub_sock:
+        cmd.extend(["--agent-hub-sock", str(hub_sock)])
     return cmd
 
 

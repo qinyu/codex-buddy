@@ -9,6 +9,10 @@ struct Palette {
 // /characters/<name>/manifest.json, parses colors, caches GIF paths.
 bool characterInit(const char* name);
 bool characterLoaded();
+// Switch pack by name; falls back to fallbackName (default "Mao") on miss.
+// No-op when the requested pack is already loaded.
+bool characterSelect(const char* name, const char* fallbackName = "Mao");
+const char* characterCurrentName();
 
 // 0..6: sleep, idle, busy, attention, completed, dizzy, heart.
 // Closes current GIF, opens the one for this state. No-op if same state.

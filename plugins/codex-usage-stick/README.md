@@ -88,6 +88,32 @@ when Codex shows it.
 python3 -m pip install bleak
 ```
 
+## Agent Hub (multi-agent hooks)
+
+The BLE bridge listens on `~/.codex/codex-usage-bridge/agent-hub.sock` for
+Ping Island-shaped hook JSON (identity via `source` / `client_kind` /
+`client_name`, events via `hook_event_name`).
+
+Codex Stick plugin hooks already dual-send into that socket via
+`hook_entry.py` (Island integrations stay separate).
+
+For Pi / Hermes / Cursor / other Island clients, wrap the existing
+`ping-island-bridge` command with the tee helper so Island keeps working
+and Stick gets the same event:
+
+```bash
+python3 /path/to/codex-buddy/tools/agent_hub_hook_tee.py -- \
+  ~/.ping-island/bin/ping-island-bridge \
+  --source claude --client-kind pi --client-name "Pi Agent" \
+  --client-origin cli --client-originator Pi --thread-source pi-extension
+```
+
+`dsh`: use the same tee once a Ping Island-shaped hook path exists; until
+then treat dsh as a follow-up adapter (Agent Hub already accepts
+`client_kind: dsh`).
+
+Config key: `"agent_hub_sock"` (default path above).
+
 ## Runtime Files
 
 ```text
@@ -95,6 +121,7 @@ python3 -m pip install bleak
 ~/.codex/codex-usage-bridge/hook.log
 ~/.codex/codex-usage-bridge/bridge.log
 ~/.codex/codex-usage-bridge/bridge.pid
+~/.codex/codex-usage-bridge/agent-hub.sock
 ```
 
 ## Config
@@ -109,7 +136,9 @@ Default `config.json`:
   "scan_timeout": 8.0,
   "restart_delay": 5.0,
   "verbose": true,
-  "no_approval_proxy": true
+  "no_approval_proxy": true,
+  "opencodex": true,
+  "agent_hub_sock": "~/.codex/codex-usage-bridge/agent-hub.sock"
 }
 ```
 
