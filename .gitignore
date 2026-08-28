@@ -6,13 +6,3 @@ data/*
 data/characters/*
 !data/characters/Mao/
 !data/characters/Mao/**
-!data/characters/Codex/
-!data/characters/Codex/**
-!data/characters/Pi/
-!data/characters/Pi/**
-!data/characters/Hermes/
-!data/characters/Hermes/**
-!data/characters/Cursor/
-!data/characters/Cursor/**
-!data/characters/Dsh/
-!data/characters/Dsh/**
