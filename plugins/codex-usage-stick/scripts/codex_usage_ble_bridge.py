@@ -218,7 +218,7 @@ def state_from_hook_event(event_name: str) -> str | None:
     if key in {"userpromptsubmit", "pretooluse", "posttooluse", "notification", "precompact", "postcompact"}:
         return "busy"
     if key in {"sessionend"}:
-        return "completed"
+        return "gone"  # leave the carousel entirely
     if key in {"stop", "sessionstart"}:
         return "idle"
     return None
@@ -252,7 +252,12 @@ class HubAgent:
 
 
 class AgentHub:
-    """Multi-agent roster fed by Ping Island-shaped hook events."""
+    """Multi-agent roster fed by Ping Island-shaped hook events.
+
+    Presence is session-scoped: agents appear on activity and disappear on
+    SessionEnd or after ``presence_window`` with no events — not parked as
+    idle/sleep placeholders.
+    """
 
     def __init__(
         self,
@@ -261,7 +266,8 @@ class AgentHub:
         attention_window: float = 120.0,
         completed_window: float = 25.0,
         sleep_window: float = 20 * 60.0,
-        recent_window: float = 45 * 60.0,
+        recent_window: float = 5 * 60.0,
+        presence_window: float | None = None,
         rotate_idle_sec: float = 12.0,
         rotate_busy_sec: float = 28.0,
         manual_grace_sec: float = 45.0,
@@ -270,7 +276,9 @@ class AgentHub:
         self.attention_window = attention_window
         self.completed_window = completed_window
         self.sleep_window = sleep_window
-        self.recent_window = recent_window
+        # ponytail: one window for “still in use”; SessionEnd drops immediately.
+        self.presence_window = float(presence_window if presence_window is not None else recent_window)
+        self.recent_window = self.presence_window
         self.rotate_idle_sec = rotate_idle_sec
         self.rotate_busy_sec = rotate_busy_sec
         self.manual_grace_sec = manual_grace_sec
@@ -293,10 +301,23 @@ class AgentHub:
             self.agents[aid].title = agent_title_for(aid, payload)
         return self.agents[aid]
 
-    def ingest_hook(self, payload: dict[str, Any], now: float | None = None) -> HubAgent:
+    def drop_agent(self, agent_id: str) -> None:
+        aid = normalize_agent_id(agent_id) or agent_id
+        self.agents.pop(aid, None)
+        self.order = [x for x in self.order if x != aid]
+        if self.current_id == aid:
+            self.current_id = self.order[0] if self.order else None
+            self._rotate_started_at = time.time()
+
+    def ingest_hook(self, payload: dict[str, Any], now: float | None = None) -> HubAgent | None:
         flat = flatten_hook_payload(payload)
         now = time.time() if now is None else now
         agent_id = resolve_agent_id(flat)
+        mapped = state_from_hook_event(hook_event_name(flat))
+        if mapped == "gone":
+            self.drop_agent(agent_id)
+            return None
+
         agent = self.ensure_agent(agent_id, flat)
         agent.from_hook = True
         agent.last_event_at = now
@@ -304,7 +325,6 @@ class AgentHub:
         if isinstance(session, str) and session.strip():
             agent.session_id = session.strip()
 
-        mapped = state_from_hook_event(hook_event_name(flat))
         if mapped == "attention":
             agent.state = "attention"
             agent.last_attention_at = now
@@ -319,28 +339,34 @@ class AgentHub:
         elif mapped == "idle":
             agent.state = "idle"
             agent.last_busy_at = None
-        # Unknown events still refresh last_event_at so the agent stays in the roster.
+        # Unknown events still refresh last_event_at so the agent stays present.
         return agent
 
-    def note_codex_fallback(self, state: str, now: float | None = None) -> HubAgent:
-        """Keep Codex visible from rollout/OpenCodex activity when hooks are quiet."""
+    def note_codex_fallback(self, state: str, now: float | None = None) -> HubAgent | None:
+        """Surface Codex only while Codex itself is active — not forever via meters."""
         now = time.time() if now is None else now
-        agent = self.ensure_agent("codex")
-        if agent.from_hook and is_recent(agent.last_event_at, self.busy_window, now):
+        if state in {"busy", "attention", "completed"}:
+            agent = self.ensure_agent("codex")
+            if agent.from_hook and is_recent(agent.last_event_at, self.busy_window, now):
+                return agent
+            agent.last_event_at = now
+            agent.state = state
+            if state in {"busy", "attention"}:
+                agent.last_busy_at = now
+                if state == "attention":
+                    agent.last_attention_at = now
+            elif state == "completed":
+                agent.last_completed_at = now
             return agent
-        agent.last_event_at = max(agent.last_event_at, now)
-        agent.state = state
-        if state in {"busy", "attention"}:
-            agent.last_busy_at = now
-            if state == "attention":
-                agent.last_attention_at = now
-        elif state == "completed":
-            agent.last_completed_at = now
+        # idle/sleep must not keep refreshing presence; let prune drop it.
+        agent = self.agents.get("codex")
+        if agent is not None and not agent.from_hook:
+            agent.state = state
         return agent
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        for agent in self.agents.values():
+        for agent in list(self.agents.values()):
             if agent.state == "attention":
                 if not is_recent(agent.last_attention_at, self.attention_window, now):
                     agent.state = "busy" if is_recent(agent.last_busy_at, self.busy_window, now) else "idle"
@@ -348,25 +374,25 @@ class AgentHub:
                 agent.state = "idle"
             if agent.state == "completed" and not is_recent(agent.last_completed_at, self.completed_window, now):
                 agent.state = "idle"
-            if agent.state == "idle" and agent.last_event_at and now - agent.last_event_at >= self.sleep_window:
-                agent.state = "sleep"
+        self.prune(now)
+
+    def prune(self, now: float | None = None) -> None:
+        """Drop agents that are no longer in use (exit or quiet too long)."""
+        now = time.time() if now is None else now
+        for aid in list(self.order):
+            agent = self.agents.get(aid)
+            if agent is None or not is_recent(agent.last_event_at, self.presence_window, now):
+                self.drop_agent(aid)
 
     def visible_ids(self, now: float | None = None) -> list[str]:
         now = time.time() if now is None else now
-        visible = [
-            aid
-            for aid in self.order
-            if aid in self.agents and is_recent(self.agents[aid].last_event_at, self.recent_window, now)
-        ]
-        if not visible and self.order:
-            # Always keep at least the current/first agent so chrome stays valid.
-            cur = self.current_id if self.current_id in self.agents else self.order[0]
-            return [cur]
-        return visible
+        self.prune(now)
+        return [aid for aid in self.order if aid in self.agents]
 
     def current(self, now: float | None = None) -> HubAgent | None:
         visible = self.visible_ids(now)
         if not visible:
+            self.current_id = None
             return None
         if self.current_id not in visible:
             self.current_id = visible[0]
@@ -468,12 +494,19 @@ class AgentHub:
                 response = {"ok": False, "reason": "expected object"}
             else:
                 agent = self.ingest_hook(request)
-                response = {
-                    "ok": True,
-                    "agent_id": agent.agent_id,
-                    "state": agent.state,
-                    "agent_count": len(self.visible_ids()),
-                }
+                if agent is None:
+                    response = {
+                        "ok": True,
+                        "dropped": True,
+                        "agent_count": len(self.visible_ids()),
+                    }
+                else:
+                    response = {
+                        "ok": True,
+                        "agent_id": agent.agent_id,
+                        "state": agent.state,
+                        "agent_count": len(self.visible_ids()),
+                    }
         except Exception as exc:
             response = {"ok": False, "reason": repr(exc)}
         writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
@@ -2262,7 +2295,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--opencodex-ttl",
         type=float,
-        default=30.0,
+        default=8.0,
         help="Seconds to reuse cached OpenCodex provider-quotas between refreshes",
     )
     p.add_argument(
@@ -2284,8 +2317,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--agent-recent-window",
         type=float,
-        default=45 * 60.0,
-        help="Seconds an agent stays in the carousel after last event",
+        default=5 * 60.0,
+        help="Seconds without hook activity before an agent is removed from the carousel",
     )
     p.add_argument("--agent-rotate-idle", type=float, default=12.0)
     p.add_argument("--agent-rotate-busy", type=float, default=28.0)

@@ -33,8 +33,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Usage meters come from OpenCodex provider-quotas; Codex sessions still
     # feed pet activity + Stick PermissionRequest approval via the same bridge.
     "opencodex": True,
+    # Refresh OpenCodex quotas often so Stick meters track upstream updates.
+    "opencodex_ttl": 8.0,
     # Ping Island-shaped hooks tee into this unix socket for Agent Hub.
     "agent_hub_sock": str(STATE_DIR / "agent-hub.sock"),
+    # Drop agents from the carousel after this many quiet seconds (SessionEnd drops immediately).
+    "agent_recent_window": 300.0,
 }
 
 SHUTDOWN = False
@@ -114,6 +118,8 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
     hub_sock = cfg.get("agent_hub_sock")
     if hub_sock:
         cmd.extend(["--agent-hub-sock", str(hub_sock)])
+    if cfg.get("agent_recent_window") is not None:
+        cmd.extend(["--agent-recent-window", str(cfg["agent_recent_window"])])
     return cmd
 
 

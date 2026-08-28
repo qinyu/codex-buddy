@@ -56,13 +56,13 @@ class AgentIdentityTests(unittest.TestCase):
     def test_hook_event_mapping(self) -> None:
         self.assertEqual(state_from_hook_event("UserPromptSubmit"), "busy")
         self.assertEqual(state_from_hook_event("PermissionRequest"), "attention")
-        self.assertEqual(state_from_hook_event("SessionEnd"), "completed")
+        self.assertEqual(state_from_hook_event("SessionEnd"), "gone")
         self.assertEqual(state_from_hook_event("Stop"), "idle")
 
 
 class AgentHubPacketTests(unittest.TestCase):
     def test_interleaved_hooks_build_roster_and_packet_state(self) -> None:
-        hub = AgentHub(busy_window=60, attention_window=120, completed_window=25, sleep_window=1200)
+        hub = AgentHub(busy_window=60, attention_window=120, completed_window=25, presence_window=600)
         now = 1_700_000_000.0
         hub.ingest_hook(
             {
@@ -118,32 +118,49 @@ class AgentHubPacketTests(unittest.TestCase):
         self.assertEqual(packet["provider"], "openai")
         self.assertEqual(packet["provider_count"], 3)
 
-    def test_session_end_and_quiet_timeout_clear_stale_busy(self) -> None:
-        hub = AgentHub(busy_window=30, completed_window=10, sleep_window=100)
+    def test_session_end_removes_agent_from_carousel(self) -> None:
+        hub = AgentHub(presence_window=600)
         now = 1_700_000_100.0
+        hub.ingest_hook(
+            {"client_kind": "dsh", "hook_event_name": "UserPromptSubmit"},
+            now=now,
+        )
         hub.ingest_hook(
             {"client_kind": "pi", "hook_event_name": "UserPromptSubmit"},
             now=now,
         )
-        self.assertEqual(hub.agents["pi"].state, "busy")
+        self.assertIn("dsh", hub.agents)
         hub.ingest_hook(
-            {"client_kind": "pi", "hook_event_name": "SessionEnd"},
+            {"client_kind": "dsh", "hook_event_name": "SessionEnd"},
             now=now + 1,
         )
-        self.assertEqual(hub.agents["pi"].state, "completed")
-        hub.tick(now=now + 20)
-        self.assertEqual(hub.agents["pi"].state, "idle")
+        self.assertNotIn("dsh", hub.agents)
+        self.assertNotIn("dsh", hub.visible_ids(now=now + 1))
+        self.assertIn("pi", hub.visible_ids(now=now + 1))
 
+    def test_quiet_timeout_prunes_agent_entirely(self) -> None:
+        hub = AgentHub(presence_window=30)
+        now = 1_700_000_200.0
         hub.ingest_hook(
             {"client_kind": "hermes", "hook_event_name": "PreToolUse"},
-            now=now + 30,
+            now=now,
         )
-        self.assertEqual(hub.agents["hermes"].state, "busy")
-        hub.tick(now=now + 80)
-        self.assertEqual(hub.agents["hermes"].state, "idle")
+        self.assertEqual(hub.visible_ids(now=now + 1), ["hermes"])
+        hub.tick(now=now + 40)
+        self.assertEqual(hub.visible_ids(now=now + 40), [])
+        self.assertNotIn("hermes", hub.agents)
+
+    def test_idle_codex_fallback_does_not_pin_forever(self) -> None:
+        hub = AgentHub(presence_window=30)
+        now = 1_700_000_300.0
+        hub.note_codex_fallback("busy", now=now)
+        self.assertIn("codex", hub.agents)
+        hub.note_codex_fallback("idle", now=now + 1)  # must not refresh presence
+        hub.prune(now=now + 40)
+        self.assertNotIn("codex", hub.agents)
 
     def test_agent_next_prev_updates_packet_index(self) -> None:
-        hub = AgentHub()
+        hub = AgentHub(presence_window=600)
         now = 1_700_000_200.0
         for kind, event in (
             ("codex", "UserPromptSubmit"),
@@ -167,7 +184,7 @@ class AgentHubPacketTests(unittest.TestCase):
         self.assertEqual(hub.current_id, "codex")
 
     def test_auto_rotate_prefers_busy_and_respects_manual_grace(self) -> None:
-        hub = AgentHub(rotate_idle_sec=5, rotate_busy_sec=20, manual_grace_sec=30)
+        hub = AgentHub(rotate_idle_sec=5, rotate_busy_sec=20, manual_grace_sec=30, presence_window=600)
         now = 1_700_000_300.0
         hub.ingest_hook({"client_kind": "codex", "source": "codex", "hook_event_name": "Stop"}, now=now)
         hub.ingest_hook({"client_kind": "pi", "hook_event_name": "UserPromptSubmit"}, now=now)
