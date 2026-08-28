@@ -14,12 +14,15 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import select
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +43,12 @@ DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
+PROVIDER_INDEX_PATH = STATE_DIR / "provider_index.json"
+DEFAULT_OPENCODEX_URL = "http://127.0.0.1:10100"
+DEFAULT_OPENCODEX_TOKEN_FILE = Path.home() / ".opencodex" / "admin-api-token"
 PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
 SECONDARY_RESET_WINDOW_SEC = 7 * 24 * 60 * 60
+MONTHLY_RESET_WINDOW_SEC = 30 * 24 * 60 * 60
 APP_SERVER_USAGE_SOURCE = Path("account-rateLimits-read")
 
 INTERESTING_LINE_MARKERS = (
@@ -134,6 +141,382 @@ class ActivityTracker:
         return "idle"
 
 
+FIRST_CLASS_AGENT_IDS: tuple[str, ...] = ("codex", "pi", "hermes", "cursor", "dsh")
+
+AGENT_TITLES: dict[str, str] = {
+    "codex": "CODEX",
+    "pi": "PI",
+    "hermes": "HERMES",
+    "cursor": "CURSOR",
+    "dsh": "DSH",
+}
+
+
+def normalize_agent_id(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-")
+    return text or None
+
+
+def resolve_agent_id(payload: dict[str, Any]) -> str:
+    """Map Ping Island-shaped identity metadata onto a stable agent id."""
+    for key in ("client_kind", "agent_id", "client_originator"):
+        aid = normalize_agent_id(payload.get(key))
+        if aid in FIRST_CLASS_AGENT_IDS:
+            return aid
+        if aid:
+            for known in FIRST_CLASS_AGENT_IDS:
+                if known in aid or aid in known:
+                    return known
+
+    for key in ("client_name", "thread_source"):
+        raw = str(payload.get(key) or "").strip().lower()
+        for known in FIRST_CLASS_AGENT_IDS:
+            if known in raw:
+                return known
+
+    source = normalize_agent_id(payload.get("source"))
+    if source == "codex":
+        return "codex"
+    if source in FIRST_CLASS_AGENT_IDS:
+        return source
+    if source:
+        return source
+    return "codex"
+
+
+def agent_title_for(agent_id: str, payload: dict[str, Any] | None = None) -> str:
+    if agent_id in AGENT_TITLES:
+        return AGENT_TITLES[agent_id]
+    if payload:
+        for key in ("client_name", "client_originator", "agent"):
+            name = str(payload.get(key) or "").strip()
+            if name:
+                return short_text(name.upper(), agent_id.upper(), 12)
+    return short_text(agent_id.upper(), "AGENT", 12)
+
+
+def hook_event_name(payload: dict[str, Any]) -> str:
+    for key in ("hook_event_name", "event", "event_name", "type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = payload.get("hook")
+    if isinstance(nested, dict):
+        return hook_event_name(nested)
+    return ""
+
+
+def state_from_hook_event(event_name: str) -> str | None:
+    key = re.sub(r"[^a-z]", "", event_name.strip().lower())
+    if not key:
+        return None
+    if key in {"permissionrequest"}:
+        return "attention"
+    if key in {"userpromptsubmit", "pretooluse", "posttooluse", "notification", "precompact", "postcompact"}:
+        return "busy"
+    if key in {"sessionend"}:
+        return "gone"  # leave the carousel entirely
+    if key in {"stop", "sessionstart"}:
+        return "idle"
+    return None
+
+
+def flatten_hook_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Accept tee/dual-send envelopes and flatten identity + event fields."""
+    flat = dict(payload)
+    nested = payload.get("hook")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            flat.setdefault(key, value)
+    inner = payload.get("payload")
+    if isinstance(inner, dict):
+        for key, value in inner.items():
+            flat.setdefault(key, value)
+    return flat
+
+
+@dataclass
+class HubAgent:
+    agent_id: str
+    title: str
+    state: str = "idle"
+    last_event_at: float = 0.0
+    last_busy_at: float | None = None
+    last_attention_at: float | None = None
+    last_completed_at: float | None = None
+    session_id: str | None = None
+    from_hook: bool = False
+
+
+class AgentHub:
+    """Multi-agent roster fed by Ping Island-shaped hook events.
+
+    Presence is session-scoped: agents appear on activity and disappear on
+    SessionEnd or after ``presence_window`` with no events — not parked as
+    idle/sleep placeholders.
+    """
+
+    def __init__(
+        self,
+        *,
+        busy_window: float = 60.0,
+        attention_window: float = 120.0,
+        completed_window: float = 25.0,
+        sleep_window: float = 20 * 60.0,
+        recent_window: float = 5 * 60.0,
+        presence_window: float | None = None,
+        rotate_idle_sec: float = 12.0,
+        rotate_busy_sec: float = 28.0,
+        manual_grace_sec: float = 45.0,
+    ) -> None:
+        self.busy_window = busy_window
+        self.attention_window = attention_window
+        self.completed_window = completed_window
+        self.sleep_window = sleep_window
+        # ponytail: one window for “still in use”; SessionEnd drops immediately.
+        self.presence_window = float(presence_window if presence_window is not None else recent_window)
+        self.recent_window = self.presence_window
+        self.rotate_idle_sec = rotate_idle_sec
+        self.rotate_busy_sec = rotate_busy_sec
+        self.manual_grace_sec = manual_grace_sec
+        self.agents: dict[str, HubAgent] = {}
+        self.order: list[str] = []
+        self.current_id: str | None = None
+        self.manual_grace_until = 0.0
+        self._rotate_started_at = time.time()
+        self._ipc_server: asyncio.AbstractServer | None = None
+
+    def ensure_agent(self, agent_id: str, payload: dict[str, Any] | None = None) -> HubAgent:
+        aid = normalize_agent_id(agent_id) or "codex"
+        if aid not in self.agents:
+            self.agents[aid] = HubAgent(agent_id=aid, title=agent_title_for(aid, payload))
+            self.order.append(aid)
+            if self.current_id is None:
+                self.current_id = aid
+                self._rotate_started_at = time.time()
+        elif payload:
+            self.agents[aid].title = agent_title_for(aid, payload)
+        return self.agents[aid]
+
+    def drop_agent(self, agent_id: str) -> None:
+        aid = normalize_agent_id(agent_id) or agent_id
+        self.agents.pop(aid, None)
+        self.order = [x for x in self.order if x != aid]
+        if self.current_id == aid:
+            self.current_id = self.order[0] if self.order else None
+            self._rotate_started_at = time.time()
+
+    def ingest_hook(self, payload: dict[str, Any], now: float | None = None) -> HubAgent | None:
+        flat = flatten_hook_payload(payload)
+        now = time.time() if now is None else now
+        agent_id = resolve_agent_id(flat)
+        mapped = state_from_hook_event(hook_event_name(flat))
+        if mapped == "gone":
+            self.drop_agent(agent_id)
+            return None
+
+        agent = self.ensure_agent(agent_id, flat)
+        agent.from_hook = True
+        agent.last_event_at = now
+        session = flat.get("session_id")
+        if isinstance(session, str) and session.strip():
+            agent.session_id = session.strip()
+
+        if mapped == "attention":
+            agent.state = "attention"
+            agent.last_attention_at = now
+            agent.last_busy_at = now
+        elif mapped == "busy":
+            agent.state = "busy"
+            agent.last_busy_at = now
+        elif mapped == "completed":
+            agent.state = "completed"
+            agent.last_completed_at = now
+            agent.last_busy_at = None
+        elif mapped == "idle":
+            agent.state = "idle"
+            agent.last_busy_at = None
+        # Unknown events still refresh last_event_at so the agent stays present.
+        return agent
+
+    def note_codex_fallback(self, state: str, now: float | None = None) -> HubAgent | None:
+        """Surface Codex only while Codex itself is active — not forever via meters."""
+        now = time.time() if now is None else now
+        if state in {"busy", "attention", "completed"}:
+            agent = self.ensure_agent("codex")
+            if agent.from_hook and is_recent(agent.last_event_at, self.busy_window, now):
+                return agent
+            agent.last_event_at = now
+            agent.state = state
+            if state in {"busy", "attention"}:
+                agent.last_busy_at = now
+                if state == "attention":
+                    agent.last_attention_at = now
+            elif state == "completed":
+                agent.last_completed_at = now
+            return agent
+        # idle/sleep must not keep refreshing presence; let prune drop it.
+        agent = self.agents.get("codex")
+        if agent is not None and not agent.from_hook:
+            agent.state = state
+        return agent
+
+    def tick(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for agent in list(self.agents.values()):
+            if agent.state == "attention":
+                if not is_recent(agent.last_attention_at, self.attention_window, now):
+                    agent.state = "busy" if is_recent(agent.last_busy_at, self.busy_window, now) else "idle"
+            if agent.state == "busy" and not is_recent(agent.last_busy_at, self.busy_window, now):
+                agent.state = "idle"
+            if agent.state == "completed" and not is_recent(agent.last_completed_at, self.completed_window, now):
+                agent.state = "idle"
+        self.prune(now)
+
+    def prune(self, now: float | None = None) -> None:
+        """Drop agents that are no longer in use (exit or quiet too long)."""
+        now = time.time() if now is None else now
+        for aid in list(self.order):
+            agent = self.agents.get(aid)
+            if agent is None or not is_recent(agent.last_event_at, self.presence_window, now):
+                self.drop_agent(aid)
+
+    def visible_ids(self, now: float | None = None) -> list[str]:
+        now = time.time() if now is None else now
+        self.prune(now)
+        return [aid for aid in self.order if aid in self.agents]
+
+    def current(self, now: float | None = None) -> HubAgent | None:
+        visible = self.visible_ids(now)
+        if not visible:
+            self.current_id = None
+            return None
+        if self.current_id not in visible:
+            self.current_id = visible[0]
+            self._rotate_started_at = time.time() if now is None else now
+        return self.agents[self.current_id]
+
+    def current_index(self, now: float | None = None) -> int:
+        visible = self.visible_ids(now)
+        if not visible or self.current_id not in visible:
+            return 0
+        return visible.index(self.current_id)
+
+    def advance(self, action: str = "next", index: int | None = None, now: float | None = None) -> HubAgent | None:
+        now = time.time() if now is None else now
+        visible = self.visible_ids(now)
+        if not visible:
+            return None
+        if index is not None:
+            self.current_id = visible[max(0, min(index, len(visible) - 1))]
+        elif action == "prev":
+            cur = self.current_index(now)
+            self.current_id = visible[(cur - 1) % len(visible)]
+        else:
+            cur = self.current_index(now)
+            self.current_id = visible[(cur + 1) % len(visible)]
+        self.manual_grace_until = now + self.manual_grace_sec
+        self._rotate_started_at = now
+        return self.agents.get(self.current_id) if self.current_id else None
+
+    def maybe_auto_rotate(self, now: float | None = None) -> HubAgent | None:
+        now = time.time() if now is None else now
+        visible = self.visible_ids(now)
+        if len(visible) <= 1:
+            return self.current(now)
+        if now < self.manual_grace_until:
+            return self.current(now)
+        current = self.current(now)
+        if not current:
+            return None
+        dwell = self.rotate_busy_sec if current.state in {"busy", "attention"} else self.rotate_idle_sec
+        if now - self._rotate_started_at < dwell:
+            return current
+        # Prefer next busy/attention agent when available.
+        start = self.current_index(now)
+        for offset in range(1, len(visible) + 1):
+            candidate_id = visible[(start + offset) % len(visible)]
+            candidate = self.agents[candidate_id]
+            if candidate.state in {"busy", "attention"} or offset == len(visible):
+                self.current_id = candidate_id
+                self._rotate_started_at = now
+                break
+        return self.current(now)
+
+    def apply_to_snapshot(self, snapshot: UsageSnapshot, now: float | None = None) -> str | None:
+        self.tick(now)
+        agent = self.current(now)
+        if not agent:
+            return None
+        visible = self.visible_ids(now)
+        snapshot.agent = agent.title
+        snapshot.agent_id = agent.agent_id
+        snapshot.agent_index = self.current_index(now)
+        snapshot.agent_count = len(visible)
+        return agent.state
+
+    async def start_ipc_server(self, sock: Path, verbose: bool = False) -> None:
+        sock = sock.expanduser()
+        sock.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            sock.unlink()
+        self._ipc_server = await asyncio.start_unix_server(
+            self._handle_ipc_client,
+            path=str(sock),
+        )
+        with contextlib.suppress(OSError):
+            sock.chmod(0o600)
+        if verbose:
+            print(f"[agent-hub] hook IPC listening at {sock}", file=sys.stderr)
+
+    async def close_ipc_server(self, sock: Path | None = None) -> None:
+        if self._ipc_server:
+            self._ipc_server.close()
+            await self._ipc_server.wait_closed()
+            self._ipc_server = None
+        if sock:
+            with contextlib.suppress(FileNotFoundError):
+                sock.expanduser().unlink()
+
+    async def _handle_ipc_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        response: dict[str, Any]
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            request = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(request, dict):
+                response = {"ok": False, "reason": "expected object"}
+            else:
+                agent = self.ingest_hook(request)
+                if agent is None:
+                    response = {
+                        "ok": True,
+                        "dropped": True,
+                        "agent_count": len(self.visible_ids()),
+                    }
+                else:
+                    response = {
+                        "ok": True,
+                        "agent_id": agent.agent_id,
+                        "state": agent.state,
+                        "agent_count": len(self.visible_ids()),
+                    }
+        except Exception as exc:
+            response = {"ok": False, "reason": repr(exc)}
+        writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
 @dataclass
 class UsageSnapshot:
     tokens: int
@@ -150,18 +533,77 @@ class UsageSnapshot:
     attention_at: float | None = None
     dizzy_at: float | None = None
     last_activity_at: float | None = None
+    provider: str | None = None
+    label: str | None = None
+    provider_index: int | None = None
+    provider_count: int | None = None
+    primary_label: str | None = None
+    secondary_label: str | None = None
+    primary_display: str | None = None
+    secondary_display: str | None = None
+    show_secondary: bool | None = None
+    tertiary: int | None = None
+    tertiary_label: str | None = None
+    tertiary_display: str | None = None
+    tertiary_resets_at: int | None = None
+    meter_count: int | None = None
+    agent: str | None = None
+    agent_id: str | None = None
+    agent_index: int | None = None
+    agent_count: int | None = None
 
     def packet(self, state: str) -> dict[str, Any]:
         now = int(time.time())
-        return {
+        packet: dict[str, Any] = {
             "state": state,
             "tokens": self.tokens,
             "primary": self.primary,
             "secondary": self.secondary,
-            "primary_resets_at": roll_reset_at(self.primary_resets_at, PRIMARY_RESET_WINDOW_SEC, now),
-            "secondary_resets_at": roll_reset_at(self.secondary_resets_at, SECONDARY_RESET_WINDOW_SEC, now),
+            "primary_resets_at": roll_reset_at(
+                self.primary_resets_at, reset_window_sec_for_label(self.primary_label), now
+            ),
+            "secondary_resets_at": roll_reset_at(
+                self.secondary_resets_at, reset_window_sec_for_label(self.secondary_label), now
+            ),
             "now": now,
         }
+        if self.provider:
+            packet["provider"] = self.provider
+        if self.label:
+            packet["label"] = provider_display_label(self.label, self.provider or "", 15)
+        if self.provider_count is not None and self.provider_count >= 1:
+            packet["provider_index"] = self.provider_index or 0
+            packet["provider_count"] = self.provider_count
+        if self.primary_label:
+            packet["primary_label"] = self.primary_label
+        if self.secondary_label:
+            packet["secondary_label"] = self.secondary_label
+        if self.primary_display:
+            packet["primary_display"] = self.primary_display
+        if self.secondary_display:
+            packet["secondary_display"] = self.secondary_display
+        if self.show_secondary is False:
+            packet["show_secondary"] = False
+        if self.meter_count and self.meter_count != 2:
+            packet["meter_count"] = self.meter_count
+        if self.tertiary is not None:
+            packet["tertiary"] = self.tertiary
+        if self.tertiary_label:
+            packet["tertiary_label"] = self.tertiary_label
+        if self.tertiary_display:
+            packet["tertiary_display"] = self.tertiary_display
+        if self.tertiary_resets_at:
+            packet["tertiary_resets_at"] = roll_reset_at(
+                self.tertiary_resets_at, reset_window_sec_for_label(self.tertiary_label), now
+            )
+        # Agent Hub chrome (defaults; AgentHub.apply_to_snapshot overrides when active).
+        agent_title = short_text(self.agent or "CODEX", "CODEX", 12)
+        agent_id = short_text(self.agent_id or "codex", "codex", 16)
+        packet["agent"] = agent_title
+        packet["agent_id"] = agent_id
+        packet["agent_index"] = int(self.agent_index if self.agent_index is not None else 0)
+        packet["agent_count"] = int(self.agent_count if self.agent_count is not None else 1)
+        return packet
 
 
 def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
@@ -169,6 +611,17 @@ def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
         return reset_at
     windows_elapsed = (now - reset_at) // window_sec + 1
     return reset_at + windows_elapsed * window_sec
+
+
+def reset_window_sec_for_label(label: str | None) -> int:
+    key = str(label or "").strip().lower()
+    if key == "5h":
+        return PRIMARY_RESET_WINDOW_SEC
+    if key == "7d":
+        return SECONDARY_RESET_WINDOW_SEC
+    if key in {"mo", "tot", "1st", "api"}:
+        return MONTHLY_RESET_WINDOW_SEC
+    return 0
 
 
 def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
@@ -616,6 +1069,393 @@ def choose_best_rate_limit_snapshot(
     return max(exact or fresh, key=snapshot_event_key)
 
 
+@dataclass(frozen=True)
+class ProviderBar:
+    percent: int
+    label: str
+    reset_at: int
+    display: str | None = None
+
+
+def normalize_reset_at(value: Any) -> int:
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if ts <= 0:
+        return 0
+    # OpenCodex mixes second and millisecond epochs depending on upstream API.
+    if ts > 10_000_000_000:
+        ts //= 1000
+    return ts
+
+
+def whole_amount_text(value: Any) -> str | None:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount < 0:
+        return None
+    whole = int(round(amount))
+    if whole > 999:
+        whole = 999
+    return str(whole)
+
+
+def parse_balance_display(label: str) -> str | None:
+    match = re.search(r"\$(\d+(?:\.\d{1,2})?)", label)
+    if not match:
+        return None
+    return whole_amount_text(match.group(1))
+
+
+def format_usd_amount(value: Any) -> str | None:
+    return whole_amount_text(value)
+
+
+def bar_is_visible(bar: ProviderBar) -> bool:
+    if bar.display:
+        return True
+    if bar.label:
+        return True
+    return bar.percent > 0
+
+
+def make_provider_bar(
+    percent: Any,
+    label: str,
+    reset_at: Any = 0,
+    *,
+    display: str | None = None,
+) -> ProviderBar:
+    return ProviderBar(
+        clamp_percent(percent),
+        label,
+        normalize_reset_at(reset_at),
+        display=display,
+    )
+
+
+def map_custom_window(window: dict[str, Any]) -> ProviderBar:
+    label_text = str(window.get("label") or "")
+    percent = window.get("percent")
+    balance_display = parse_balance_display(label_text) if isinstance(percent, (int, float)) and float(percent) == 0 else None
+    if balance_display:
+        return make_provider_bar(0, "", window.get("resetAt"), display=balance_display)
+    return make_provider_bar(
+        percent if isinstance(percent, (int, float)) else 0,
+        short_window_label(label_text, "use"),
+        window.get("resetAt"),
+    )
+
+
+@dataclass(frozen=True)
+class ProviderQuotaView:
+    primary: ProviderBar
+    secondary: ProviderBar
+    tertiary: ProviderBar | None = None
+    meter_count: int = 2
+
+
+def custom_windows_usable(custom: Any) -> list[dict[str, Any]]:
+    if not isinstance(custom, list):
+        return []
+    windows: list[dict[str, Any]] = [w for w in custom if isinstance(w, dict)]
+    return [
+        w
+        for w in windows
+        if isinstance(w.get("percent"), (int, float))
+        or parse_balance_display(str(w.get("label") or ""))
+    ]
+
+
+def view_meter_count(primary: ProviderBar, secondary: ProviderBar, tertiary: ProviderBar | None) -> int:
+    if tertiary and bar_is_visible(tertiary):
+        return 3
+    if bar_is_visible(secondary):
+        return 2
+    if bar_is_visible(primary):
+        return 1
+    return 1
+
+
+def make_quota_view(
+    primary: ProviderBar,
+    secondary: ProviderBar,
+    tertiary: ProviderBar | None = None,
+) -> ProviderQuotaView:
+    return ProviderQuotaView(
+        primary=primary,
+        secondary=secondary,
+        tertiary=tertiary,
+        meter_count=view_meter_count(primary, secondary, tertiary),
+    )
+
+
+def short_window_label(label: str, fallback: str = "--") -> str:
+    text = str(label or "").strip()
+    if not text:
+        return fallback
+    lowered = text.lower()
+    for needle, short in (
+        ("first-party", "1st"),
+        ("first party", "1st"),
+        ("api usage", "API"),
+        ("5 hour", "5h"),
+        ("5-hour", "5h"),
+        ("five hour", "5h"),
+        ("5h", "5h"),
+        ("7 day", "7d"),
+        ("7-day", "7d"),
+        ("weekly", "7d"),
+        ("week", "7d"),
+        ("monthly", "mo"),
+        ("month", "mo"),
+        ("total", "tot"),
+    ):
+        if needle in lowered:
+            return short
+    if lowered.startswith("api"):
+        return "API"
+    if len(text) <= 4:
+        return text
+    return text[:4]
+
+
+def quota_is_displayable(quota: dict[str, Any]) -> bool:
+    if not quota:
+        return False
+    for key in ("fiveHourPercent", "weeklyPercent", "monthlyPercent", "shortPercent"):
+        if isinstance(quota.get(key), (int, float)):
+            return True
+    custom = quota.get("customWindows")
+    if isinstance(custom, list) and custom:
+        return True
+    credits = quota.get("creditsUsd")
+    return isinstance(credits, dict) and isinstance(credits.get("percent"), (int, float))
+
+
+def map_provider_quota(quota: dict[str, Any]) -> ProviderQuotaView:
+    empty = ProviderBar(0, "", 0)
+    if not quota:
+        return make_quota_view(empty, empty)
+
+    if (
+        isinstance(quota.get("fiveHourPercent"), (int, float))
+        and isinstance(quota.get("weeklyPercent"), (int, float))
+        and isinstance(quota.get("monthlyPercent"), (int, float))
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")),
+            make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")),
+        )
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)) and isinstance(
+        quota.get("weeklyPercent"), (int, float)
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")),
+        )
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)) and isinstance(
+        quota.get("monthlyPercent"), (int, float)
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")),
+        )
+
+    custom = quota.get("customWindows")
+    usable = custom_windows_usable(custom)
+    if isinstance(quota.get("monthlyPercent"), (int, float)) and len(usable) >= 2:
+        return make_quota_view(
+            make_provider_bar(quota["monthlyPercent"], "tot", quota.get("monthlyResetAt")),
+            map_custom_window(usable[0]),
+            map_custom_window(usable[1]),
+        )
+
+    if len(usable) >= 2:
+        return make_quota_view(map_custom_window(usable[0]), map_custom_window(usable[1]))
+    if len(usable) == 1:
+        return make_quota_view(map_custom_window(usable[0]), empty)
+
+    if isinstance(quota.get("monthlyPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")), empty)
+
+    if isinstance(quota.get("weeklyPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")), empty)
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")), empty)
+
+    credits = quota.get("creditsUsd")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            return make_quota_view(
+                ProviderBar(0, "inf", normalize_reset_at(credits.get("expiresAt")), display="∞"),
+                empty,
+            )
+        if isinstance(credits.get("percent"), (int, float)):
+            remaining_display = format_usd_amount(credits.get("remaining"))
+            return make_quota_view(
+                make_provider_bar(
+                    credits["percent"],
+                    "",
+                    credits.get("expiresAt"),
+                    display=remaining_display,
+                ),
+                empty,
+            )
+
+    return make_quota_view(empty, empty)
+
+
+class OpenCodexProviders:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.reports: list[dict[str, Any]] = []
+        self.index = 0
+        self.last_fetch = 0.0
+        self._load_index()
+
+    def _load_index(self) -> None:
+        try:
+            data = json.loads(PROVIDER_INDEX_PATH.read_text(encoding="utf-8"))
+            self.index = int(data.get("index") or 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            self.index = 0
+
+    def _save_index(self) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        PROVIDER_INDEX_PATH.write_text(
+            json.dumps({"index": self.index}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    def advance(self, action: str, index: int | None = None) -> None:
+        count = len(self.reports)
+        if count <= 0:
+            return
+        if action == "set" and index is not None:
+            self.index = max(0, min(index, count - 1))
+        elif action == "prev":
+            self.index = (self.index - 1) % count
+        else:
+            self.index = (self.index + 1) % count
+        self._save_index()
+
+    def fetch_reports(self, force: bool = False) -> list[dict[str, Any]]:
+        now = time.time()
+        if (
+            not force
+            and self.reports
+            and now - self.last_fetch < self.args.opencodex_ttl
+        ):
+            return self.reports
+
+        token_path = self.args.opencodex_token_file.expanduser()
+        token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            raise RuntimeError(f"OpenCodex admin token missing: {token_path}")
+
+        url = self.args.opencodex_url.rstrip("/") + "/api/provider-quotas"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.args.opencodex_timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenCodex provider-quotas HTTP {exc.code}: {body[:200]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenCodex provider-quotas unreachable at {url}: {exc}") from exc
+
+        reports = [
+            report
+            for report in (payload.get("reports") or [])
+            if isinstance(report, dict) and quota_is_displayable(report.get("quota") or {})
+        ]
+        if not reports:
+            raise RuntimeError("OpenCodex returned no displayable provider quotas")
+
+        self.reports = reports
+        self.last_fetch = now
+        if self.index >= len(self.reports):
+            self.index = 0
+            self._save_index()
+        return self.reports
+
+    def current_report(self) -> dict[str, Any]:
+        if not self.reports:
+            self.fetch_reports()
+        return self.reports[self.index]
+
+
+def read_codex_activity_snapshot(args: argparse.Namespace) -> UsageSnapshot | None:
+    try:
+        return read_usage(args)
+    except RuntimeError:
+        return None
+
+
+def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) -> UsageSnapshot:
+    store.fetch_reports(force=False)
+    report = store.current_report()
+    quota = report.get("quota") or {}
+    view = map_provider_quota(quota)
+    primary_bar = view.primary
+    secondary_bar = view.secondary
+    tertiary_bar = view.tertiary
+    show_secondary = view.meter_count >= 2 and bar_is_visible(secondary_bar)
+
+    activity = read_codex_activity_snapshot(args)
+    tokens = activity.tokens if activity else 0
+    event_ts = activity.event_ts if activity else None
+
+    provider = str(report.get("provider") or "")
+    label = str(report.get("label") or provider)
+    return UsageSnapshot(
+        tokens=tokens,
+        primary=primary_bar.percent,
+        secondary=secondary_bar.percent,
+        primary_resets_at=primary_bar.reset_at,
+        secondary_resets_at=secondary_bar.reset_at,
+        source=Path(f"opencodex:{provider or 'unknown'}"),
+        event_ts=event_ts,
+        limit_id=provider or None,
+        limit_name=label or None,
+        task_started_at=activity.task_started_at if activity else None,
+        task_complete_at=activity.task_complete_at if activity else None,
+        attention_at=activity.attention_at if activity else None,
+        dizzy_at=activity.dizzy_at if activity else None,
+        last_activity_at=activity.last_activity_at if activity else None,
+        provider=provider or None,
+        label=label or None,
+        provider_index=store.index,
+        provider_count=len(store.reports),
+        primary_label=primary_bar.label or None,
+        secondary_label=(secondary_bar.label or None) if show_secondary else None,
+        primary_display=primary_bar.display,
+        secondary_display=secondary_bar.display if show_secondary else None,
+        show_secondary=show_secondary,
+        tertiary=tertiary_bar.percent if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_label=(tertiary_bar.label or None) if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_display=tertiary_bar.display if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_resets_at=tertiary_bar.reset_at if tertiary_bar and view.meter_count >= 3 else None,
+        meter_count=view.meter_count,
+        agent="CODEX",
+        agent_id="codex",
+        agent_index=0,
+        agent_count=1,
+    )
+
+
 def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     paths = latest_rollout_paths(args.codex_home, args.thread_id, args.thread_scan_limit)
     if args.rollout:
@@ -701,6 +1541,17 @@ def short_text(value: Any, fallback: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)] + "..."
+
+
+def provider_display_label(value: Any, fallback: str = "", limit: int = 15) -> str:
+    """Prefer the full short label; if too long, keep only the first word."""
+    text = str(value or fallback or "USAGE").replace("\n", " ").strip() or "USAGE"
+    if len(text) <= limit:
+        return text
+    word = text.split(None, 1)[0]
+    if len(word) <= limit:
+        return word
+    return word[:limit]
 
 
 class BleSession:
@@ -1204,15 +2055,29 @@ async def send_usage_update(
     tracker: ActivityTracker,
     ble: BleSession | None = None,
     approvals: CodexApprovalProxy | None = None,
+    opencodex: OpenCodexProviders | None = None,
+    force_refresh: bool = False,
+    hub: AgentHub | None = None,
 ) -> None:
     if approvals and approvals.has_pending():
         return
 
-    snapshot = await asyncio.to_thread(read_usage, args)
+    if opencodex:
+        if force_refresh:
+            await asyncio.to_thread(opencodex.fetch_reports, True)
+        snapshot = await asyncio.to_thread(read_opencodex_usage, args, opencodex)
+    else:
+        snapshot = await asyncio.to_thread(read_usage, args)
     if approvals and approvals.has_pending():
         return
 
     state = choose_state(args, snapshot, tracker)
+    if hub is not None:
+        hub.note_codex_fallback(state)
+        hub.maybe_auto_rotate()
+        hub_state = hub.apply_to_snapshot(snapshot)
+        if hub_state:
+            state = hub_state
     packet = snapshot.packet(state)
     line = json.dumps(packet, separators=(",", ":"))
 
@@ -1234,12 +2099,29 @@ async def send_usage_update(
 async def bridge_loop(args: argparse.Namespace) -> None:
     setattr(find_device, "debug_scan", args.debug_scan)
     tracker = ActivityTracker()
+    opencodex = OpenCodexProviders(args) if args.opencodex else None
+    hub = AgentHub(
+        busy_window=args.busy_window,
+        attention_window=args.attention_window,
+        completed_window=args.completed_window,
+        sleep_window=args.sleep_window,
+        recent_window=args.agent_recent_window,
+        rotate_idle_sec=args.agent_rotate_idle,
+        rotate_busy_sec=args.agent_rotate_busy,
+        manual_grace_sec=args.agent_manual_grace,
+    )
     if args.dry_run:
-        while True:
-            await send_usage_update(args, tracker)
-            if args.once:
-                return
-            await asyncio.sleep(args.interval)
+        if args.agent_hub_sock:
+            await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
+        try:
+            while True:
+                await send_usage_update(args, tracker, opencodex=opencodex, hub=hub)
+                if args.once:
+                    return
+                await asyncio.sleep(args.interval)
+        finally:
+            await hub.close_ipc_server(args.agent_hub_sock)
+        return
 
     assert BleakClient is not None
     dev = await find_device(args.name, args.address, args.scan_timeout)
@@ -1255,12 +2137,14 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         approvals = CodexApprovalProxy(args, ble)
         await approvals.start_ipc_server()
         await approvals.start()
+        if args.agent_hub_sock:
+            await hub.start_ipc_server(args.agent_hub_sock, verbose=args.verbose)
         if args.test_approval:
             await approvals.inject_test_request()
 
         async def usage_runner() -> None:
             while True:
-                await send_usage_update(args, tracker, ble, approvals)
+                await send_usage_update(args, tracker, ble, approvals, opencodex, hub=hub)
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -1268,6 +2152,49 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         async def device_runner() -> None:
             while True:
                 msg = await ble.incoming.get()
+                if opencodex and msg.get("cmd") == "provider":
+                    action = str(msg.get("action") or "next")
+                    index = msg.get("index")
+                    parsed_index = int(index) if isinstance(index, int) else None
+                    opencodex.advance(action, parsed_index)
+                    if args.verbose:
+                        current = opencodex.current_report()
+                        print(
+                            f"[provider] {action} -> {current.get('label') or current.get('provider')} "
+                            f"({opencodex.index + 1}/{len(opencodex.reports)})",
+                            file=sys.stderr,
+                        )
+                    await send_usage_update(
+                        args,
+                        tracker,
+                        ble,
+                        approvals,
+                        opencodex,
+                        force_refresh=True,
+                        hub=hub,
+                    )
+                    continue
+                if msg.get("cmd") == "agent":
+                    action = str(msg.get("action") or "next")
+                    index = msg.get("index")
+                    parsed_index = int(index) if isinstance(index, int) else None
+                    selected = hub.advance(action, parsed_index)
+                    if args.verbose and selected:
+                        print(
+                            f"[agent] {action} -> {selected.title} "
+                            f"({hub.current_index() + 1}/{len(hub.visible_ids())})",
+                            file=sys.stderr,
+                        )
+                    await send_usage_update(
+                        args,
+                        tracker,
+                        ble,
+                        approvals,
+                        opencodex,
+                        force_refresh=True,
+                        hub=hub,
+                    )
+                    continue
                 await approvals.handle_device_message(msg)
 
         try:
@@ -1277,6 +2204,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
             await asyncio.gather(usage_runner(), device_runner())
         finally:
             await approvals.close_ipc_server()
+            await hub.close_ipc_server(args.agent_hub_sock)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1348,6 +2276,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument(
+        "--opencodex",
+        action="store_true",
+        help="Read multi-provider quotas from a local OpenCodex server",
+    )
+    p.add_argument(
+        "--opencodex-url",
+        default=DEFAULT_OPENCODEX_URL,
+        help="OpenCodex management API base URL",
+    )
+    p.add_argument(
+        "--opencodex-token-file",
+        type=Path,
+        default=DEFAULT_OPENCODEX_TOKEN_FILE,
+        help="File containing the OpenCodex admin API bearer token",
+    )
+    p.add_argument("--opencodex-timeout", type=float, default=8.0)
+    p.add_argument(
+        "--opencodex-ttl",
+        type=float,
+        default=8.0,
+        help="Seconds to reuse cached OpenCodex provider-quotas between refreshes",
+    )
+    p.add_argument(
         "--state",
         default="auto",
         choices=["auto", "idle", "busy", "attention", "completed", "celebrate", "dizzy", "heart", "sleep"],
@@ -1357,6 +2308,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--attention-window", type=float, default=120.0)
     p.add_argument("--dizzy-window", type=float, default=60.0)
     p.add_argument("--sleep-window", type=float, default=20 * 60.0)
+    p.add_argument(
+        "--agent-hub-sock",
+        type=Path,
+        default=None,
+        help="Unix socket for Ping Island-shaped Agent Hub hook events (line-delimited JSON)",
+    )
+    p.add_argument(
+        "--agent-recent-window",
+        type=float,
+        default=5 * 60.0,
+        help="Seconds without hook activity before an agent is removed from the carousel",
+    )
+    p.add_argument("--agent-rotate-idle", type=float, default=12.0)
+    p.add_argument("--agent-rotate-busy", type=float, default=28.0)
+    p.add_argument("--agent-manual-grace", type=float, default=45.0)
     return p
 
 
@@ -1369,8 +2335,12 @@ def main() -> int:
         args.approval_sock = args.approval_sock.expanduser()
     if args.hook_approval_sock:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
+    if args.agent_hub_sock:
+        args.agent_hub_sock = args.agent_hub_sock.expanduser()
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
+    if args.opencodex_token_file:
+        args.opencodex_token_file = args.opencodex_token_file.expanduser()
 
     if not args.dry_run and (BleakClient is None or BleakScanner is None):
         print("Missing dependency: bleak. Install with `python3 -m pip install bleak`.", file=sys.stderr)

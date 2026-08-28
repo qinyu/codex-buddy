@@ -33,6 +33,7 @@ static uint32_t  textNext = 0;
 static bool    loaded = false;
 static Palette pal = { 0xC2A6, 0x0000, 0xFFFF, 0x8410, 0x0000 };
 static char    basePath[48];
+static char    currentPackName[24] = "";
 static const uint8_t MAX_GIFS = 32;
 static char    gifPaths[MAX_GIFS][32];
 static uint8_t stateStart[N_STATES];
@@ -239,6 +240,8 @@ bool characterInit(const char* name) {
       }
     }
     loaded = true;
+    strncpy(currentPackName, name, sizeof(currentPackName) - 1);
+    currentPackName[sizeof(currentPackName) - 1] = 0;
     Serial.printf("[char] loaded '%s' (text mode, %d states)\n", name, N_STATES);
     return true;
   }
@@ -263,11 +266,33 @@ bool characterInit(const char* name) {
 
   gif.begin(LITTLE_ENDIAN_PIXELS);
   loaded = true;
-  Serial.printf("[char] loaded '%s' from %s\n", (const char*)doc["name"], basePath);
+  {
+    const char* shown = doc["name"] | name;
+    strncpy(currentPackName, name, sizeof(currentPackName) - 1);
+    currentPackName[sizeof(currentPackName) - 1] = 0;
+    Serial.printf("[char] loaded '%s' from %s\n", shown, basePath);
+  }
   return true;
 }
 
 bool characterLoaded() { return loaded; }
+const char* characterCurrentName() { return currentPackName; }
+
+bool characterSelect(const char* name, const char* fallbackName) {
+  if (!name || !*name) name = fallbackName;
+  if (!name || !*name) name = "Mao";
+  if (loaded && strcmp(currentPackName, name) == 0) return true;
+  characterClose();
+  if (characterInit(name)) return true;
+  if (fallbackName && *fallbackName && strcmp(fallbackName, name) != 0) {
+    if (characterInit(fallbackName)) return true;
+  }
+  if (strcmp(name, "Mao") != 0 && (!fallbackName || strcmp(fallbackName, "Mao") != 0)) {
+    return characterInit("Mao");
+  }
+  return false;
+}
+
 const Palette& characterPalette() { return pal; }
 
 // One-shot half-scale render to an arbitrary surface (M5.Lcd for the
@@ -471,17 +496,21 @@ void characterTick() {
     if (now < textNext) return;
     textNext = now + ts.delayMs;
 
-    // Clear a band around the text, not the whole sprite — keeps overlays
-    // like the approval panel and the HUD untouched.
-    int cy = peekMode ? 35 : 60;
-    spr.fillRect(0, cy - 14, spr.width(), 28, pal.bg);
-
+    // StickS3 pet peek is ~100px tall / 135 wide — size 2 was unreadably small.
     const char* line = ts.frames[textFrame];
-    int len = strlen(line);
-    int tw = len * 12;                                    // size-2 glyph width
+    int len = (int)strlen(line);
+    if (len < 1) len = 1;
+    int textSize = peekMode ? 4 : 5;
+    while (textSize > 2 && len * 6 * textSize > spr.width() - 4) textSize--;
+    int glyphW = 6 * textSize;
+    int glyphH = 8 * textSize;
+    int cy = peekMode ? (peekTopY + peekClipH / 2) : 60;
+    spr.fillRect(0, cy - glyphH / 2 - 2, spr.width(), glyphH + 4, pal.bg);
+
+    int tw = len * glyphW;
     spr.setTextColor(pal.body, pal.bg);
-    spr.setTextSize(2);
-    spr.setCursor((spr.width() - tw) / 2, cy - 8);
+    spr.setTextSize(textSize);
+    spr.setCursor((spr.width() - tw) / 2, cy - glyphH / 2);
     spr.print(line);
 
     textFrame = (textFrame + 1) % ts.nFrames;

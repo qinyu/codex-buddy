@@ -1,0 +1,21 @@
+{
+  "name": "Dsh",
+  "mode": "text",
+  "colors": {
+    "body": "#FFFFFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "textDim": "#808080",
+    "ink": "#000000"
+  },
+  "states": {
+    "sleep": {"delay": 400, "frames": ["D."]},
+    "idle": {"delay": 300, "frames": ["Dsh"]},
+    "busy": {"delay": 180, "frames": ["Dsh*", "Dsh"]},
+    "attention": {"delay": 160, "frames": ["!Dsh!", "Dsh"]},
+    "completed": {"delay": 220, "frames": ["Dsh+", "Dsh"]},
+    "celebrate": {"delay": 180, "frames": ["*Dsh*", "Dsh"]},
+    "dizzy": {"delay": 120, "frames": ["@Dsh", "Dsh"]},
+    "heart": {"delay": 200, "frames": ["<Dsh>", "Dsh"]}
+  }
+}
