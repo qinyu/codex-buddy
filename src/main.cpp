@@ -28,6 +28,13 @@ const int CY_BASE = 120;
 const int USAGE_PET_TOP = 26;
 const int USAGE_PET_H = 100;
 const int USAGE_PET_BOTTOM = USAGE_PET_TOP + USAGE_PET_H;
+const int USAGE_ROW1_Y = 142;
+const int USAGE_ROW2_Y = 172;
+const int USAGE_ROW3_Y = 202;
+const int USAGE_SLOT_H = 30;
+const int USAGE_PCT_COL_W = 22;
+const int USAGE_LABEL_COL_W = 18;
+const int USAGE_INNER_GAP = 2;
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 const int LED_PIN = -1;          // no user LED on StickS3
 #else
@@ -55,6 +62,7 @@ bool    menuOpen    = false;
 uint8_t menuSel     = 0;
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
+bool    btnBLong    = false;
 const uint16_t BUTTON_STABLE_MS = 40;
 bool    btnAStablePress = false;
 bool    btnBStablePress = false;
@@ -714,7 +722,7 @@ void drawInfo() {
   if (infoPage == 0) {
     _infoHeader(p, y, "ABOUT", infoPage);
     spr.setTextColor(p.textDim, p.bg);
-    ln("I watch your Codex");
+    ln("I show provider");
     ln("usage over BLE.");
     y += 6;
     ln("The home screen shows");
@@ -722,8 +730,10 @@ void drawInfo() {
     ln("long usage windows.");
     y += 6;
     spr.setTextColor(p.text, p.bg);
-    ln("Primary is fixed 5h.");
-    ln("Secondary is fixed 7d.");
+    ln("Windows vary by");
+    ln("provider.");
+    ln("Bar + label; reset");
+    ln("below; up to 3 rows.");
     y += 6;
     spr.setTextColor(p.textDim, p.bg);
     ln("Pet GIFs are paused");
@@ -736,6 +746,8 @@ void drawInfo() {
     ln("    approve prompt"); y += 4;
     spr.setTextColor(p.text, p.bg);    ln("B   right side");
     spr.setTextColor(p.textDim, p.bg); ln("    next page");
+    ln("    next provider");
+    ln("    hold B = prev");
     ln("    deny prompt"); y += 4;
     spr.setTextColor(p.text, p.bg);    ln("hold A");
     spr.setTextColor(p.textDim, p.bg); ln("    menu"); y += 4;
@@ -744,7 +756,7 @@ void drawInfo() {
     ln("    hold 6s = off");
 
   } else if (infoPage == 2) {
-    _infoHeader(p, y, "CODEX", infoPage);
+    _infoHeader(p, y, "USAGE", infoPage);
     spr.setTextColor(p.textDim, p.bg);
     ln("  tokens    %lu", (unsigned long)tama.codexTokens);
     ln("  primary   %u%%", tama.codexPrimary);
@@ -824,9 +836,8 @@ void drawInfo() {
       spr.setTextColor(p.text, p.bg);
       ln("TO PAIR");
       spr.setTextColor(p.textDim, p.bg);
-      ln(" Start the Codex");
-      ln(" usage BLE bridge");
-      ln(" on this Mac.");
+      ln(" Start the usage");
+      ln(" bridge on this Mac.");
       y += 4;
       ln(" It writes JSON");
       ln(" over BLE.");
@@ -1135,65 +1146,142 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
   }
 }
 
-static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
-                             uint8_t pct, const char* windowLabel,
-                             uint32_t resetAt, bool live, const Palette& p) {
+static const char* usageHeaderTitle() {
+  return tama.codexProviderLabel[0] ? tama.codexProviderLabel : "USAGE";
+}
+
+static const char* usagePrimaryWindowLabel() {
+  if (tama.codexPrimaryLabel[0]) return tama.codexPrimaryLabel;
+  if (tama.codexPrimaryDisplay[0]) return "";
+  return "5h";
+}
+
+static const char* usageSecondaryWindowLabel() {
+  return tama.codexSecondaryLabel[0] ? tama.codexSecondaryLabel : "7d";
+}
+
+static const char* usageTertiaryWindowLabel() {
+  return tama.codexTertiaryLabel[0] ? tama.codexTertiaryLabel : "mo";
+}
+
+static bool usageShowSecondRow() {
+  // WAIT: always reserve 3 rows so the layout stays complete before LIVE.
+  return !tama.connected || tama.codexMeterCount >= 2;
+}
+
+static bool usageShowThirdRow() {
+  return !tama.connected || tama.codexMeterCount >= 3;
+}
+
+static void drawUsageSlotOn(lgfx::v1::LGFXBase* dst, int x, int w, int y,
+                             uint8_t pct, const char* windowLabel, uint32_t resetAt,
+                             bool live, const Palette& p, const char* valueText,
+                             bool expanded) {
   if (pct > 100) pct = 100;
   uint16_t fill = live ? usageColor(pct, p) : p.textDim;
+
   char left[8];
-  snprintf(left, sizeof(left), "%u%%", pct);
-
-  dst->setTextSize(2);
-  dst->setTextDatum(TL_DATUM);
-  dst->setTextColor(live ? p.text : p.textDim, p.bg);
-  dst->drawString(left, x, y);
-  dst->setTextDatum(TR_DATUM);
-  dst->drawString(windowLabel, x + w, y);
-
-  const int bx = x, by = y + 24, bw = w, bh = 13;
-  dst->drawRect(bx, by, bw, bh, p.textDim);
-  dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
-  int fw = (int)((uint32_t)(bw - 2) * pct / 100);
-  if (fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
+  if (valueText && valueText[0]) {
+    strncpy(left, valueText, sizeof(left) - 1);
+    left[sizeof(left) - 1] = 0;
+  } else if (pct >= 100) {
+    snprintf(left, sizeof(left), "100");
+  } else {
+    snprintf(left, sizeof(left), "%u%%", pct);
+  }
 
   dst->setTextSize(1);
+  // Default font is 8px tall; center bar + left/right labels on the same midline.
+  const int textH = 8;
+  const int barH = expanded ? 10 : 8;
+  const int midY = y + textH / 2;
+  const int barX = x + USAGE_PCT_COL_W + USAGE_INNER_GAP;
+  const int barW = w - USAGE_PCT_COL_W - USAGE_LABEL_COL_W - USAGE_INNER_GAP * 2;
+  const int barY = midY - barH / 2;
+
+  dst->setTextDatum(ML_DATUM);
+  dst->setTextColor(live ? p.text : p.textDim, p.bg);
+  dst->drawString(left, x, midY);
+
+  dst->drawRect(barX, barY, barW, barH, p.textDim);
+  dst->fillRect(barX + 1, barY + 1, barW - 2, barH - 2, p.bg);
+  int fw = (int)((uint32_t)(barW - 2) * pct / 100);
+  if (fw > 0) dst->fillRect(barX + 1, barY + 1, fw, barH - 2, fill);
+
+  if (windowLabel && windowLabel[0]) {
+    dst->setTextDatum(MR_DATUM);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString(windowLabel, x + w, midY);
+  }
   dst->setTextDatum(TL_DATUM);
-  if (live && resetAt != 0) {
-    uint32_t now = 0;
-    char rt[12];
-    resetTimeText(resetAt, rt, sizeof(rt));
-    if (dataUtcNow(&now) && resetAt > now && rt[0]) {
-      const char* prefix = "resets in ";
-      dst->setTextColor(p.textDim, p.bg);
-      dst->drawString(prefix, x, y + 44);
-      int prefixW = dst->textWidth(prefix);
-      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
-      dst->drawString(rt, x + prefixW, y + 44);
-    } else {
-      dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
-      dst->drawString("reset soon", x, y + 44);
-    }
+
+  const int resetY = barY + barH + 4;
+  char rt[12];
+  rt[0] = 0;
+  if (resetAt != 0) resetTimeText(resetAt, rt, sizeof(rt));
+  if (rt[0]) {
+    dst->setTextColor(resetColor(resetAt, windowLabel, live, p), p.bg);
+    dst->drawString(rt, x, resetY);
   } else {
     dst->setTextColor(p.textDim, p.bg);
-    dst->drawString("resets --", x, y + 44);
+    dst->drawString("-", x, resetY);
   }
 }
 
-static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
-                           uint32_t resetAt, bool live, const Palette& p) {
-  drawUsageMeterOn(&spr, 8, y, W - 16, pct, windowLabel, resetAt, live, p);
+static void drawUsageMeterZone(lgfx::v1::LGFXBase* dst, int x, int w, bool live, const Palette& p,
+                               int row1Y, int row2Y, int row3Y, int clearBelowY, int clearBelowH) {
+  const bool threeRows = usageShowThirdRow();
+  const bool twoRows = usageShowSecondRow();
+  const bool expanded = !twoRows;
+  const int zoneBottom = clearBelowY + clearBelowH;
+
+  drawUsageSlotOn(dst, x, w, row1Y, tama.codexPrimary, usagePrimaryWindowLabel(),
+                  tama.codexPrimaryResetsAt, live, p,
+                  tama.codexPrimaryDisplay[0] ? tama.codexPrimaryDisplay : nullptr,
+                  expanded);
+  if (threeRows) {
+    drawUsageSlotOn(dst, x, w, row2Y, tama.codexSecondary, usageSecondaryWindowLabel(),
+                    tama.codexSecondaryResetsAt, live, p,
+                    tama.codexSecondaryDisplay[0] ? tama.codexSecondaryDisplay : nullptr,
+                    false);
+    drawUsageSlotOn(dst, x, w, row3Y, tama.codexTertiary, usageTertiaryWindowLabel(),
+                    tama.codexTertiaryResetsAt, live, p,
+                    tama.codexTertiaryDisplay[0] ? tama.codexTertiaryDisplay : nullptr,
+                    false);
+  } else if (twoRows) {
+    drawUsageSlotOn(dst, x, w, row2Y, tama.codexSecondary, usageSecondaryWindowLabel(),
+                    tama.codexSecondaryResetsAt, live, p,
+                    tama.codexSecondaryDisplay[0] ? tama.codexSecondaryDisplay : nullptr,
+                    false);
+    if (zoneBottom > row3Y) {
+      dst->fillRect(x, row3Y, w, zoneBottom - row3Y, p.bg);
+    }
+  } else if (zoneBottom > row2Y) {
+    dst->fillRect(x, row2Y, w, zoneBottom - row2Y, p.bg);
+  }
 }
 
 static void drawUsageDashboard() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
+  static char cachedUsageLabel[16] = "";
+  static uint8_t cachedProvIdx = 0xFF;
+  static uint8_t cachedProvCnt = 0xFF;
+  static uint8_t cachedMeterCount = 0xFF;
 
-  if (!usageLiveKnown || usageLastLive != live) {
+  if (!usageLiveKnown || usageLastLive != live
+      || strncmp(cachedUsageLabel, usageHeaderTitle(), sizeof(cachedUsageLabel)) != 0
+      || cachedProvIdx != tama.codexProviderIndex
+      || cachedProvCnt != tama.codexProviderCount
+      || cachedMeterCount != tama.codexMeterCount) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
+    strncpy(cachedUsageLabel, usageHeaderTitle(), sizeof(cachedUsageLabel) - 1);
+    cachedUsageLabel[sizeof(cachedUsageLabel) - 1] = 0;
+    cachedProvIdx = tama.codexProviderIndex;
+    cachedProvCnt = tama.codexProviderCount;
+    cachedMeterCount = tama.codexMeterCount;
   }
 
   spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
@@ -1215,14 +1303,23 @@ static void drawUsageDashboard() {
     spr.setTextSize(1);
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(p.textDim, p.bg);
-    spr.drawString("CODEX USAGE", 8, 8);
+    spr.drawString(usageHeaderTitle(), 8, 8);
     spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(live ? GREEN : HOT, p.bg);
-    spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
+    if (tama.codexProviderCount > 1) {
+      char page[8];
+      snprintf(page, sizeof(page), "%u/%u", tama.codexProviderIndex + 1, tama.codexProviderCount);
+      spr.setTextColor(p.textDim, p.bg);
+      spr.drawString(page, W - 8, 8);
+      spr.setTextColor(live ? GREEN : HOT, p.bg);
+      spr.drawString(live ? "LIVE" : "WAIT", W - 8, 18);
+    } else {
+      spr.setTextColor(live ? GREEN : HOT, p.bg);
+      spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
+    }
   }
 
-  drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0, live, p);
-  drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0, live, p);
+  drawUsageMeterZone(&spr, 8, W - 16, live, p,
+                     USAGE_ROW1_Y, USAGE_ROW2_Y, USAGE_ROW3_Y, USAGE_ROW2_Y, H - USAGE_ROW2_Y);
 
   spr.setTextDatum(TL_DATUM);
 }
@@ -1230,15 +1327,22 @@ static void drawUsageDashboard() {
 static void drawUsageDashboardLandscape() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
-  uint32_t primaryReset = live ? tama.codexPrimaryResetsAt : 0;
-  uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
 
-  if (!usageLiveKnown || usageLastLive != live) {
+  static uint8_t cachedProvIdxLand = 0xFF;
+  static uint8_t cachedProvCntLand = 0xFF;
+  static char cachedUsageLabelLand[16] = "";
+
+  if (!usageLiveKnown || usageLastLive != live
+      || strncmp(cachedUsageLabelLand, usageHeaderTitle(), sizeof(cachedUsageLabelLand)) != 0
+      || cachedProvIdxLand != tama.codexProviderIndex
+      || cachedProvCntLand != tama.codexProviderCount) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
+    strncpy(cachedUsageLabelLand, usageHeaderTitle(), sizeof(cachedUsageLabelLand) - 1);
+    cachedUsageLabelLand[sizeof(cachedUsageLabelLand) - 1] = 0;
+    cachedProvIdxLand = tama.codexProviderIndex;
+    cachedProvCntLand = tama.codexProviderCount;
   }
 
   M5.Lcd.setRotation(clockOrient);
@@ -1247,6 +1351,15 @@ static void drawUsageDashboardLandscape() {
   const int leftW = 104;
   const int rightX = leftW + 8;
   const int rightW = lw - rightX - 8;
+  // Keep portrait-like row spacing; shift the block down to reduce bottom gap.
+  const int landSlotH = USAGE_SLOT_H;
+  const int landRows = (!tama.connected || tama.codexMeterCount >= 3) ? 3
+                      : (tama.codexMeterCount >= 2) ? 2 : 1;
+  const int landBlockH = landRows * landSlotH;
+  const int landBottomPad = 4;
+  const int landRow1Y = lh - landBottomPad - landBlockH;
+  const int landRow2Y = landRow1Y + landSlotH;
+  const int landRow3Y = landRow2Y + landSlotH;
 
   bool repaint = paintedOrient != clockOrient || usageFullPushNeeded;
   if (repaint) {
@@ -1255,44 +1368,36 @@ static void drawUsageDashboardLandscape() {
   }
 
   static bool cachedLive = false;
-  static uint8_t cachedPrimary = 0xFF;
-  static uint8_t cachedSecondary = 0xFF;
-  static uint32_t cachedPrimaryReset = 0xFFFFFFFF;
-  static uint32_t cachedSecondaryReset = 0xFFFFFFFF;
   static uint8_t cachedOrient = 0;
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
   static int cachedPetH = 0;
-  bool panelChanged = repaint
-                   || cachedOrient != clockOrient
-                   || cachedLive != live
-                   || cachedPrimary != primary
-                   || cachedSecondary != secondary
-                   || cachedPrimaryReset != primaryReset
-                   || cachedSecondaryReset != secondaryReset;
+  bool panelChanged = repaint || cachedOrient != clockOrient || cachedLive != live;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
     M5.Lcd.setTextSize(1);
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextColor(p.textDim, p.bg);
-    M5.Lcd.drawString("CODEX USAGE", rightX, 7);
+    M5.Lcd.drawString(usageHeaderTitle(), rightX, 7);
     M5.Lcd.setTextDatum(TR_DATUM);
-    M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-    M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
-
-    drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primary, "5h",
-                     primaryReset, live, p);
-    drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
-                     secondaryReset, live, p);
-
+    if (tama.codexProviderCount > 1) {
+      char page[8];
+      snprintf(page, sizeof(page), "%u/%u", tama.codexProviderIndex + 1, tama.codexProviderCount);
+      M5.Lcd.setTextColor(p.textDim, p.bg);
+      M5.Lcd.drawString(page, lw - 8, 7);
+      M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
+      M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 17);
+    } else {
+      M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
+      M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
+    }
     cachedLive = live;
-    cachedPrimary = primary;
-    cachedSecondary = secondary;
-    cachedPrimaryReset = primaryReset;
-    cachedSecondaryReset = secondaryReset;
     cachedOrient = clockOrient;
   }
+
+  drawUsageMeterZone(&M5.Lcd, rightX, rightW, live, p,
+                     landRow1Y, landRow2Y, landRow3Y, landRow2Y, lh - landRow2Y);
 
   if (characterLoaded()) {
     bool canvasChanged = false;
@@ -1414,10 +1519,10 @@ void setup() {
     spr.setTextDatum(MC_DATUM);
     spr.setTextSize(2);
     spr.setTextColor(p.body, p.bg);
-    spr.drawString("Codex", W/2, H/2 - 12);
+    spr.drawString("Usage", W/2, H/2 - 12);
     spr.setTextSize(1);
     spr.setTextColor(p.textDim, p.bg);
-    spr.drawString("usage monitor", W/2, H/2 + 12);
+    spr.drawString("monitor", W/2, H/2 + 12);
     spr.setTextDatum(TL_DATUM); spr.setTextSize(1);
     spr.pushSprite(0, 0);
     delay(1800);
@@ -1577,43 +1682,66 @@ void loop() {
     btnAStablePress = false;
   }
 
-  // BtnB: pet → heart
+  // BtnB: provider short=next / long=prev; else heart / menus
+  if (btnBStablePress && M5.BtnB.pressedFor(600) && !btnBLong && !swallowBtnB) {
+    btnBLong = true;
+    if (!inPrompt && !resetOpen && !settingsOpen && !menuOpen
+        && displayMode == DISP_NORMAL && tama.codexProviderCount > 1) {
+      btnBHandled = true;
+      beep(1800, 30);
+      sendCmd("{\"cmd\":\"provider\",\"action\":\"prev\"}");
+    }
+  }
   if (btnBStablePress && !btnBHandled) {
-    btnBHandled = true;
-    if (swallowBtnB) { swallowBtnB = false; }
-    else
-    if (inPrompt) {
-      char cmd[96];
-      snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"cancel\"}", tama.promptId);
-      sendCmd(cmd);
-      responseSent = true;
-      statsOnDenial();
-      beep(600, 60);
-    } else if (resetOpen) {
-      beep(2400, 30);
-      applyReset(resetSel);
-    } else if (settingsOpen) {
-      beep(2400, 30);
-      applySetting(settingsSel);
-    } else if (menuOpen) {
-      beep(2400, 30);
-      menuConfirm();
-    } else if (displayMode == DISP_INFO) {
-      beep(2400, 30);
-      infoPage = (infoPage + 1) % INFO_PAGES;
-    } else if (displayMode == DISP_PET) {
-      beep(2400, 30);
-      petPage = (petPage + 1) % PET_PAGES;
-      applyDisplayMode();
+    // Defer provider paging until release so long-press can become prev.
+    if (!inPrompt && !resetOpen && !settingsOpen && !menuOpen
+        && displayMode == DISP_NORMAL && tama.codexProviderCount > 1) {
+      // wait for release
     } else {
-      beep(2400, 30);
-      triggerOneShot(P_HEART, 2000);
+      btnBHandled = true;
+      if (swallowBtnB) { swallowBtnB = false; }
+      else
+      if (inPrompt) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"cancel\"}", tama.promptId);
+        sendCmd(cmd);
+        responseSent = true;
+        statsOnDenial();
+        beep(600, 60);
+      } else if (resetOpen) {
+        beep(2400, 30);
+        applyReset(resetSel);
+      } else if (settingsOpen) {
+        beep(2400, 30);
+        applySetting(settingsSel);
+      } else if (menuOpen) {
+        beep(2400, 30);
+        menuConfirm();
+      } else if (displayMode == DISP_INFO) {
+        beep(2400, 30);
+        infoPage = (infoPage + 1) % INFO_PAGES;
+      } else if (displayMode == DISP_PET) {
+        beep(2400, 30);
+        petPage = (petPage + 1) % PET_PAGES;
+        applyDisplayMode();
+      } else {
+        beep(2400, 30);
+        triggerOneShot(P_HEART, 2000);
+      }
     }
   }
   if (M5.BtnB.wasReleased()) {
+    if (btnBStablePress && !btnBLong && !btnBHandled && !swallowBtnB
+        && !inPrompt && !resetOpen && !settingsOpen && !menuOpen
+        && displayMode == DISP_NORMAL && tama.codexProviderCount > 1) {
+      beep(2400, 30);
+      sendCmd("{\"cmd\":\"provider\",\"action\":\"next\"}");
+    }
+    if (swallowBtnB) swallowBtnB = false;
     btnBDownMs = 0;
     btnBStablePress = false;
     btnBHandled = false;
+    btnBLong = false;
   }
 
   // blink bookkeeping

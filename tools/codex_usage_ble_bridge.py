@@ -14,12 +14,15 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import select
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +43,12 @@ DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
+PROVIDER_INDEX_PATH = STATE_DIR / "provider_index.json"
+DEFAULT_OPENCODEX_URL = "http://127.0.0.1:10100"
+DEFAULT_OPENCODEX_TOKEN_FILE = Path.home() / ".opencodex" / "admin-api-token"
 PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
 SECONDARY_RESET_WINDOW_SEC = 7 * 24 * 60 * 60
+MONTHLY_RESET_WINDOW_SEC = 30 * 24 * 60 * 60
 APP_SERVER_USAGE_SOURCE = Path("account-rateLimits-read")
 
 INTERESTING_LINE_MARKERS = (
@@ -150,18 +157,66 @@ class UsageSnapshot:
     attention_at: float | None = None
     dizzy_at: float | None = None
     last_activity_at: float | None = None
+    provider: str | None = None
+    label: str | None = None
+    provider_index: int | None = None
+    provider_count: int | None = None
+    primary_label: str | None = None
+    secondary_label: str | None = None
+    primary_display: str | None = None
+    secondary_display: str | None = None
+    show_secondary: bool | None = None
+    tertiary: int | None = None
+    tertiary_label: str | None = None
+    tertiary_display: str | None = None
+    tertiary_resets_at: int | None = None
+    meter_count: int | None = None
 
     def packet(self, state: str) -> dict[str, Any]:
         now = int(time.time())
-        return {
+        packet: dict[str, Any] = {
             "state": state,
             "tokens": self.tokens,
             "primary": self.primary,
             "secondary": self.secondary,
-            "primary_resets_at": roll_reset_at(self.primary_resets_at, PRIMARY_RESET_WINDOW_SEC, now),
-            "secondary_resets_at": roll_reset_at(self.secondary_resets_at, SECONDARY_RESET_WINDOW_SEC, now),
+            "primary_resets_at": roll_reset_at(
+                self.primary_resets_at, reset_window_sec_for_label(self.primary_label), now
+            ),
+            "secondary_resets_at": roll_reset_at(
+                self.secondary_resets_at, reset_window_sec_for_label(self.secondary_label), now
+            ),
             "now": now,
         }
+        if self.provider:
+            packet["provider"] = self.provider
+        if self.label:
+            packet["label"] = short_text(self.label, self.provider or "", 15)
+        if self.provider_count is not None and self.provider_count >= 1:
+            packet["provider_index"] = self.provider_index or 0
+            packet["provider_count"] = self.provider_count
+        if self.primary_label:
+            packet["primary_label"] = self.primary_label
+        if self.secondary_label:
+            packet["secondary_label"] = self.secondary_label
+        if self.primary_display:
+            packet["primary_display"] = self.primary_display
+        if self.secondary_display:
+            packet["secondary_display"] = self.secondary_display
+        if self.show_secondary is False:
+            packet["show_secondary"] = False
+        if self.meter_count and self.meter_count != 2:
+            packet["meter_count"] = self.meter_count
+        if self.tertiary is not None:
+            packet["tertiary"] = self.tertiary
+        if self.tertiary_label:
+            packet["tertiary_label"] = self.tertiary_label
+        if self.tertiary_display:
+            packet["tertiary_display"] = self.tertiary_display
+        if self.tertiary_resets_at:
+            packet["tertiary_resets_at"] = roll_reset_at(
+                self.tertiary_resets_at, reset_window_sec_for_label(self.tertiary_label), now
+            )
+        return packet
 
 
 def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
@@ -169,6 +224,17 @@ def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
         return reset_at
     windows_elapsed = (now - reset_at) // window_sec + 1
     return reset_at + windows_elapsed * window_sec
+
+
+def reset_window_sec_for_label(label: str | None) -> int:
+    key = str(label or "").strip().lower()
+    if key == "5h":
+        return PRIMARY_RESET_WINDOW_SEC
+    if key == "7d":
+        return SECONDARY_RESET_WINDOW_SEC
+    if key in {"mo", "tot", "1st", "api"}:
+        return MONTHLY_RESET_WINDOW_SEC
+    return 0
 
 
 def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
@@ -614,6 +680,389 @@ def choose_best_rate_limit_snapshot(
     fresh = [s for s in valid if latest_ts - snapshot_event_key(s) <= preferred_fresh_window]
     exact = [s for s in fresh if s.limit_id == preferred_limit_id]
     return max(exact or fresh, key=snapshot_event_key)
+
+
+@dataclass(frozen=True)
+class ProviderBar:
+    percent: int
+    label: str
+    reset_at: int
+    display: str | None = None
+
+
+def normalize_reset_at(value: Any) -> int:
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if ts <= 0:
+        return 0
+    # OpenCodex mixes second and millisecond epochs depending on upstream API.
+    if ts > 10_000_000_000:
+        ts //= 1000
+    return ts
+
+
+def whole_amount_text(value: Any) -> str | None:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount < 0:
+        return None
+    whole = int(round(amount))
+    if whole > 999:
+        whole = 999
+    return str(whole)
+
+
+def parse_balance_display(label: str) -> str | None:
+    match = re.search(r"\$(\d+(?:\.\d{1,2})?)", label)
+    if not match:
+        return None
+    return whole_amount_text(match.group(1))
+
+
+def format_usd_amount(value: Any) -> str | None:
+    return whole_amount_text(value)
+
+
+def bar_is_visible(bar: ProviderBar) -> bool:
+    if bar.display:
+        return True
+    if bar.label:
+        return True
+    return bar.percent > 0
+
+
+def make_provider_bar(
+    percent: Any,
+    label: str,
+    reset_at: Any = 0,
+    *,
+    display: str | None = None,
+) -> ProviderBar:
+    return ProviderBar(
+        clamp_percent(percent),
+        label,
+        normalize_reset_at(reset_at),
+        display=display,
+    )
+
+
+def map_custom_window(window: dict[str, Any]) -> ProviderBar:
+    label_text = str(window.get("label") or "")
+    percent = window.get("percent")
+    balance_display = parse_balance_display(label_text) if isinstance(percent, (int, float)) and float(percent) == 0 else None
+    if balance_display:
+        return make_provider_bar(0, "", window.get("resetAt"), display=balance_display)
+    return make_provider_bar(
+        percent if isinstance(percent, (int, float)) else 0,
+        short_window_label(label_text, "use"),
+        window.get("resetAt"),
+    )
+
+
+@dataclass(frozen=True)
+class ProviderQuotaView:
+    primary: ProviderBar
+    secondary: ProviderBar
+    tertiary: ProviderBar | None = None
+    meter_count: int = 2
+
+
+def custom_windows_usable(custom: Any) -> list[dict[str, Any]]:
+    if not isinstance(custom, list):
+        return []
+    windows: list[dict[str, Any]] = [w for w in custom if isinstance(w, dict)]
+    return [
+        w
+        for w in windows
+        if isinstance(w.get("percent"), (int, float))
+        or parse_balance_display(str(w.get("label") or ""))
+    ]
+
+
+def view_meter_count(primary: ProviderBar, secondary: ProviderBar, tertiary: ProviderBar | None) -> int:
+    if tertiary and bar_is_visible(tertiary):
+        return 3
+    if bar_is_visible(secondary):
+        return 2
+    if bar_is_visible(primary):
+        return 1
+    return 1
+
+
+def make_quota_view(
+    primary: ProviderBar,
+    secondary: ProviderBar,
+    tertiary: ProviderBar | None = None,
+) -> ProviderQuotaView:
+    return ProviderQuotaView(
+        primary=primary,
+        secondary=secondary,
+        tertiary=tertiary,
+        meter_count=view_meter_count(primary, secondary, tertiary),
+    )
+
+
+def short_window_label(label: str, fallback: str = "--") -> str:
+    text = str(label or "").strip()
+    if not text:
+        return fallback
+    lowered = text.lower()
+    for needle, short in (
+        ("first-party", "1st"),
+        ("first party", "1st"),
+        ("api usage", "API"),
+        ("5 hour", "5h"),
+        ("5-hour", "5h"),
+        ("five hour", "5h"),
+        ("5h", "5h"),
+        ("7 day", "7d"),
+        ("7-day", "7d"),
+        ("weekly", "7d"),
+        ("week", "7d"),
+        ("monthly", "mo"),
+        ("month", "mo"),
+        ("total", "tot"),
+    ):
+        if needle in lowered:
+            return short
+    if lowered.startswith("api"):
+        return "API"
+    if len(text) <= 4:
+        return text
+    return text[:4]
+
+
+def quota_is_displayable(quota: dict[str, Any]) -> bool:
+    if not quota:
+        return False
+    for key in ("fiveHourPercent", "weeklyPercent", "monthlyPercent", "shortPercent"):
+        if isinstance(quota.get(key), (int, float)):
+            return True
+    custom = quota.get("customWindows")
+    if isinstance(custom, list) and custom:
+        return True
+    credits = quota.get("creditsUsd")
+    return isinstance(credits, dict) and isinstance(credits.get("percent"), (int, float))
+
+
+def map_provider_quota(quota: dict[str, Any]) -> ProviderQuotaView:
+    empty = ProviderBar(0, "", 0)
+    if not quota:
+        return make_quota_view(empty, empty)
+
+    if (
+        isinstance(quota.get("fiveHourPercent"), (int, float))
+        and isinstance(quota.get("weeklyPercent"), (int, float))
+        and isinstance(quota.get("monthlyPercent"), (int, float))
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")),
+            make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")),
+        )
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)) and isinstance(
+        quota.get("weeklyPercent"), (int, float)
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")),
+        )
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)) and isinstance(
+        quota.get("monthlyPercent"), (int, float)
+    ):
+        return make_quota_view(
+            make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")),
+            make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")),
+        )
+
+    custom = quota.get("customWindows")
+    usable = custom_windows_usable(custom)
+    if isinstance(quota.get("monthlyPercent"), (int, float)) and len(usable) >= 2:
+        return make_quota_view(
+            make_provider_bar(quota["monthlyPercent"], "tot", quota.get("monthlyResetAt")),
+            map_custom_window(usable[0]),
+            map_custom_window(usable[1]),
+        )
+
+    if len(usable) >= 2:
+        return make_quota_view(map_custom_window(usable[0]), map_custom_window(usable[1]))
+    if len(usable) == 1:
+        return make_quota_view(map_custom_window(usable[0]), empty)
+
+    if isinstance(quota.get("monthlyPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["monthlyPercent"], "mo", quota.get("monthlyResetAt")), empty)
+
+    if isinstance(quota.get("weeklyPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["weeklyPercent"], "7d", quota.get("weeklyResetAt")), empty)
+
+    if isinstance(quota.get("fiveHourPercent"), (int, float)):
+        return make_quota_view(make_provider_bar(quota["fiveHourPercent"], "5h", quota.get("fiveHourResetAt")), empty)
+
+    credits = quota.get("creditsUsd")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            return make_quota_view(
+                ProviderBar(0, "inf", normalize_reset_at(credits.get("expiresAt")), display="∞"),
+                empty,
+            )
+        if isinstance(credits.get("percent"), (int, float)):
+            remaining_display = format_usd_amount(credits.get("remaining"))
+            return make_quota_view(
+                make_provider_bar(
+                    credits["percent"],
+                    "",
+                    credits.get("expiresAt"),
+                    display=remaining_display,
+                ),
+                empty,
+            )
+
+    return make_quota_view(empty, empty)
+
+
+class OpenCodexProviders:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.reports: list[dict[str, Any]] = []
+        self.index = 0
+        self.last_fetch = 0.0
+        self._load_index()
+
+    def _load_index(self) -> None:
+        try:
+            data = json.loads(PROVIDER_INDEX_PATH.read_text(encoding="utf-8"))
+            self.index = int(data.get("index") or 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            self.index = 0
+
+    def _save_index(self) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        PROVIDER_INDEX_PATH.write_text(
+            json.dumps({"index": self.index}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    def advance(self, action: str, index: int | None = None) -> None:
+        count = len(self.reports)
+        if count <= 0:
+            return
+        if action == "set" and index is not None:
+            self.index = max(0, min(index, count - 1))
+        elif action == "prev":
+            self.index = (self.index - 1) % count
+        else:
+            self.index = (self.index + 1) % count
+        self._save_index()
+
+    def fetch_reports(self, force: bool = False) -> list[dict[str, Any]]:
+        now = time.time()
+        if (
+            not force
+            and self.reports
+            and now - self.last_fetch < self.args.opencodex_ttl
+        ):
+            return self.reports
+
+        token_path = self.args.opencodex_token_file.expanduser()
+        token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            raise RuntimeError(f"OpenCodex admin token missing: {token_path}")
+
+        url = self.args.opencodex_url.rstrip("/") + "/api/provider-quotas"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.args.opencodex_timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenCodex provider-quotas HTTP {exc.code}: {body[:200]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenCodex provider-quotas unreachable at {url}: {exc}") from exc
+
+        reports = [
+            report
+            for report in (payload.get("reports") or [])
+            if isinstance(report, dict) and quota_is_displayable(report.get("quota") or {})
+        ]
+        if not reports:
+            raise RuntimeError("OpenCodex returned no displayable provider quotas")
+
+        self.reports = reports
+        self.last_fetch = now
+        if self.index >= len(self.reports):
+            self.index = 0
+            self._save_index()
+        return self.reports
+
+    def current_report(self) -> dict[str, Any]:
+        if not self.reports:
+            self.fetch_reports()
+        return self.reports[self.index]
+
+
+def read_codex_activity_snapshot(args: argparse.Namespace) -> UsageSnapshot | None:
+    try:
+        return read_usage(args)
+    except RuntimeError:
+        return None
+
+
+def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) -> UsageSnapshot:
+    store.fetch_reports(force=False)
+    report = store.current_report()
+    quota = report.get("quota") or {}
+    view = map_provider_quota(quota)
+    primary_bar = view.primary
+    secondary_bar = view.secondary
+    tertiary_bar = view.tertiary
+    show_secondary = view.meter_count >= 2 and bar_is_visible(secondary_bar)
+
+    activity = read_codex_activity_snapshot(args)
+    tokens = activity.tokens if activity else 0
+    event_ts = activity.event_ts if activity else None
+
+    provider = str(report.get("provider") or "")
+    label = str(report.get("label") or provider)
+    return UsageSnapshot(
+        tokens=tokens,
+        primary=primary_bar.percent,
+        secondary=secondary_bar.percent,
+        primary_resets_at=primary_bar.reset_at,
+        secondary_resets_at=secondary_bar.reset_at,
+        source=Path(f"opencodex:{provider or 'unknown'}"),
+        event_ts=event_ts,
+        limit_id=provider or None,
+        limit_name=label or None,
+        task_started_at=activity.task_started_at if activity else None,
+        task_complete_at=activity.task_complete_at if activity else None,
+        attention_at=activity.attention_at if activity else None,
+        dizzy_at=activity.dizzy_at if activity else None,
+        last_activity_at=activity.last_activity_at if activity else None,
+        provider=provider or None,
+        label=label or None,
+        provider_index=store.index,
+        provider_count=len(store.reports),
+        primary_label=primary_bar.label or None,
+        secondary_label=(secondary_bar.label or None) if show_secondary else None,
+        primary_display=primary_bar.display,
+        secondary_display=secondary_bar.display if show_secondary else None,
+        show_secondary=show_secondary,
+        tertiary=tertiary_bar.percent if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_label=(tertiary_bar.label or None) if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_display=tertiary_bar.display if tertiary_bar and view.meter_count >= 3 else None,
+        tertiary_resets_at=tertiary_bar.reset_at if tertiary_bar and view.meter_count >= 3 else None,
+        meter_count=view.meter_count,
+    )
 
 
 def read_usage(args: argparse.Namespace) -> UsageSnapshot:
@@ -1204,11 +1653,18 @@ async def send_usage_update(
     tracker: ActivityTracker,
     ble: BleSession | None = None,
     approvals: CodexApprovalProxy | None = None,
+    opencodex: OpenCodexProviders | None = None,
+    force_refresh: bool = False,
 ) -> None:
     if approvals and approvals.has_pending():
         return
 
-    snapshot = await asyncio.to_thread(read_usage, args)
+    if opencodex:
+        if force_refresh:
+            await asyncio.to_thread(opencodex.fetch_reports, True)
+        snapshot = await asyncio.to_thread(read_opencodex_usage, args, opencodex)
+    else:
+        snapshot = await asyncio.to_thread(read_usage, args)
     if approvals and approvals.has_pending():
         return
 
@@ -1234,9 +1690,10 @@ async def send_usage_update(
 async def bridge_loop(args: argparse.Namespace) -> None:
     setattr(find_device, "debug_scan", args.debug_scan)
     tracker = ActivityTracker()
+    opencodex = OpenCodexProviders(args) if args.opencodex else None
     if args.dry_run:
         while True:
-            await send_usage_update(args, tracker)
+            await send_usage_update(args, tracker, opencodex=opencodex)
             if args.once:
                 return
             await asyncio.sleep(args.interval)
@@ -1260,7 +1717,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
 
         async def usage_runner() -> None:
             while True:
-                await send_usage_update(args, tracker, ble, approvals)
+                await send_usage_update(args, tracker, ble, approvals, opencodex)
                 if args.once:
                     return
                 await asyncio.sleep(args.interval)
@@ -1268,6 +1725,27 @@ async def bridge_loop(args: argparse.Namespace) -> None:
         async def device_runner() -> None:
             while True:
                 msg = await ble.incoming.get()
+                if opencodex and msg.get("cmd") == "provider":
+                    action = str(msg.get("action") or "next")
+                    index = msg.get("index")
+                    parsed_index = int(index) if isinstance(index, int) else None
+                    opencodex.advance(action, parsed_index)
+                    if args.verbose:
+                        current = opencodex.current_report()
+                        print(
+                            f"[provider] {action} -> {current.get('label') or current.get('provider')} "
+                            f"({opencodex.index + 1}/{len(opencodex.reports)})",
+                            file=sys.stderr,
+                        )
+                    await send_usage_update(
+                        args,
+                        tracker,
+                        ble,
+                        approvals,
+                        opencodex,
+                        force_refresh=True,
+                    )
+                    continue
                 await approvals.handle_device_message(msg)
 
         try:
@@ -1348,6 +1826,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument(
+        "--opencodex",
+        action="store_true",
+        help="Read multi-provider quotas from a local OpenCodex server",
+    )
+    p.add_argument(
+        "--opencodex-url",
+        default=DEFAULT_OPENCODEX_URL,
+        help="OpenCodex management API base URL",
+    )
+    p.add_argument(
+        "--opencodex-token-file",
+        type=Path,
+        default=DEFAULT_OPENCODEX_TOKEN_FILE,
+        help="File containing the OpenCodex admin API bearer token",
+    )
+    p.add_argument("--opencodex-timeout", type=float, default=8.0)
+    p.add_argument(
+        "--opencodex-ttl",
+        type=float,
+        default=30.0,
+        help="Seconds to reuse cached OpenCodex provider-quotas between refreshes",
+    )
+    p.add_argument(
         "--state",
         default="auto",
         choices=["auto", "idle", "busy", "attention", "completed", "celebrate", "dizzy", "heart", "sleep"],
@@ -1371,6 +1872,8 @@ def main() -> int:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
+    if args.opencodex_token_file:
+        args.opencodex_token_file = args.opencodex_token_file.expanduser()
 
     if not args.dry_run and (BleakClient is None or BleakScanner is None):
         print("Missing dependency: bleak. Install with `python3 -m pip install bleak`.", file=sys.stderr)

@@ -13,8 +13,21 @@ struct TamaState {
   uint32_t codexTokens;
   uint8_t  codexPrimary;
   uint8_t  codexSecondary;
+  uint8_t  codexTertiary;
   uint32_t codexPrimaryResetsAt;
   uint32_t codexSecondaryResetsAt;
+  uint32_t codexTertiaryResetsAt;
+  char     codexProviderLabel[16];
+  char     codexPrimaryLabel[8];
+  char     codexSecondaryLabel[8];
+  char     codexTertiaryLabel[8];
+  char     codexPrimaryDisplay[8];
+  char     codexSecondaryDisplay[8];
+  char     codexTertiaryDisplay[8];
+  bool     codexShowSecondary;
+  uint8_t  codexMeterCount;
+  uint8_t  codexProviderIndex;
+  uint8_t  codexProviderCount;
   char     codexState[16];
   uint32_t lastUpdated;
   char     msg[24];
@@ -31,7 +44,7 @@ struct TamaState {
 // Three modes, checked in priority order:
 //   demo   → auto-cycle fake scenarios every 8s, ignore live data
 //   live   → JSON arrived in the last 10s over USB or BT
-//   asleep → no data, all zeros, "No Codex bridge"
+//   asleep → no data, all zeros, "No bridge"
 // ---------------------------------------------------------------------------
 
 static uint32_t _lastLiveMs = 0;
@@ -147,8 +160,87 @@ static void _applyJson(const char* line, TamaState* out) {
     }
     out->codexPrimary = _jsonPct(doc["primary"], out->codexPrimary);
     out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
+    out->codexTertiary = _jsonPct(doc["tertiary"], out->codexTertiary);
     out->codexPrimaryResetsAt = doc["primary_resets_at"] | out->codexPrimaryResetsAt;
     out->codexSecondaryResetsAt = doc["secondary_resets_at"] | out->codexSecondaryResetsAt;
+    out->codexTertiaryResetsAt = doc["tertiary_resets_at"] | out->codexTertiaryResetsAt;
+
+    const char* prov = doc["provider"];
+    const char* lbl = doc["label"];
+    if (lbl && *lbl) {
+      strncpy(out->codexProviderLabel, lbl, sizeof(out->codexProviderLabel) - 1);
+      out->codexProviderLabel[sizeof(out->codexProviderLabel) - 1] = 0;
+    } else if (prov && *prov) {
+      strncpy(out->codexProviderLabel, prov, sizeof(out->codexProviderLabel) - 1);
+      out->codexProviderLabel[sizeof(out->codexProviderLabel) - 1] = 0;
+    }
+    const char* pl = doc["primary_label"];
+    if (pl && *pl) {
+      strncpy(out->codexPrimaryLabel, pl, sizeof(out->codexPrimaryLabel) - 1);
+      out->codexPrimaryLabel[sizeof(out->codexPrimaryLabel) - 1] = 0;
+    }
+    const char* sl = doc["secondary_label"];
+    if (sl && *sl) {
+      strncpy(out->codexSecondaryLabel, sl, sizeof(out->codexSecondaryLabel) - 1);
+      out->codexSecondaryLabel[sizeof(out->codexSecondaryLabel) - 1] = 0;
+    }
+    const char* pdisp = doc["primary_display"];
+    if (pdisp && *pdisp) {
+      strncpy(out->codexPrimaryDisplay, pdisp, sizeof(out->codexPrimaryDisplay) - 1);
+      out->codexPrimaryDisplay[sizeof(out->codexPrimaryDisplay) - 1] = 0;
+      // Balance / custom left value: clear right label unless explicitly sent.
+      if (!(pl && *pl)) out->codexPrimaryLabel[0] = 0;
+    } else {
+      out->codexPrimaryDisplay[0] = 0;
+    }
+    const char* sdisp = doc["secondary_display"];
+    if (sdisp && *sdisp) {
+      strncpy(out->codexSecondaryDisplay, sdisp, sizeof(out->codexSecondaryDisplay) - 1);
+      out->codexSecondaryDisplay[sizeof(out->codexSecondaryDisplay) - 1] = 0;
+      if (!(sl && *sl)) out->codexSecondaryLabel[0] = 0;
+    } else {
+      out->codexSecondaryDisplay[0] = 0;
+    }
+    if (doc["show_secondary"].is<bool>()) {
+      out->codexShowSecondary = doc["show_secondary"].as<bool>();
+    } else {
+      out->codexShowSecondary = true;
+    }
+    const char* tl = doc["tertiary_label"];
+    if (tl && *tl) {
+      strncpy(out->codexTertiaryLabel, tl, sizeof(out->codexTertiaryLabel) - 1);
+      out->codexTertiaryLabel[sizeof(out->codexTertiaryLabel) - 1] = 0;
+    }
+    const char* tdisp = doc["tertiary_display"];
+    if (tdisp && *tdisp) {
+      strncpy(out->codexTertiaryDisplay, tdisp, sizeof(out->codexTertiaryDisplay) - 1);
+      out->codexTertiaryDisplay[sizeof(out->codexTertiaryDisplay) - 1] = 0;
+      if (!(tl && *tl)) out->codexTertiaryLabel[0] = 0;
+    } else {
+      out->codexTertiaryDisplay[0] = 0;
+    }
+    if (doc["meter_count"].is<uint8_t>() || doc["meter_count"].is<int>()) {
+      int meters = doc["meter_count"].as<int>();
+      if (meters < 1) meters = 1;
+      if (meters > 3) meters = 3;
+      out->codexMeterCount = (uint8_t)meters;
+    } else if (out->codexTertiaryLabel[0] || doc["tertiary"].is<int>()) {
+      out->codexMeterCount = 3;
+    } else {
+      out->codexMeterCount = out->codexShowSecondary ? 2 : 1;
+    }
+    if (doc["provider_index"].is<uint8_t>() || doc["provider_index"].is<int>()) {
+      int idx = doc["provider_index"].as<int>();
+      if (idx < 0) idx = 0;
+      if (idx > 255) idx = 255;
+      out->codexProviderIndex = (uint8_t)idx;
+    }
+    if (doc["provider_count"].is<uint8_t>() || doc["provider_count"].is<int>()) {
+      int cnt = doc["provider_count"].as<int>();
+      if (cnt < 0) cnt = 0;
+      if (cnt > 255) cnt = 255;
+      out->codexProviderCount = (uint8_t)cnt;
+    }
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;
     out->sessionsWaiting = strcmp(out->codexState, "attention") == 0 ? 1 : 0;
@@ -158,7 +250,7 @@ static void _applyJson(const char* line, TamaState* out) {
 
     const char* m = doc["message"];
     if (!m) m = doc["msg"];
-    if (!m) m = "Codex usage live";
+    if (!m) m = "Usage live";
     strncpy(out->msg, m, sizeof(out->msg) - 1);
     out->msg[sizeof(out->msg) - 1] = 0;
 
@@ -256,7 +348,22 @@ inline void dataPoll(TamaState* out) {
   if (!out->connected) {
     out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
     out->recentlyCompleted=false; out->lastUpdated=now;
-    strncpy(out->msg, "No Codex bridge", sizeof(out->msg)-1);
+    strncpy(out->msg, "No bridge", sizeof(out->msg)-1);
     out->msg[sizeof(out->msg)-1]=0;
+    // Clear stale LIVE meters so WAIT shows empty 3-row placeholders.
+    out->codexPrimary = 0;
+    out->codexSecondary = 0;
+    out->codexTertiary = 0;
+    out->codexPrimaryResetsAt = 0;
+    out->codexSecondaryResetsAt = 0;
+    out->codexTertiaryResetsAt = 0;
+    out->codexPrimaryLabel[0] = 0;
+    out->codexSecondaryLabel[0] = 0;
+    out->codexTertiaryLabel[0] = 0;
+    out->codexPrimaryDisplay[0] = 0;
+    out->codexSecondaryDisplay[0] = 0;
+    out->codexTertiaryDisplay[0] = 0;
+    out->codexMeterCount = 3;
+    out->codexShowSecondary = true;
   }
 }
