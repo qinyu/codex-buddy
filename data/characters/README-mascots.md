@@ -4,7 +4,7 @@ GIF frames are exported from Ping Island's `MascotView` via:
 
 ```bash
 ./scripts/render-mascots.sh --status all --size 96 \
-  --kind codex,pi,hermes,cursor
+  --kind codex,pi,hermes,cursor,kimi
 ```
 
 Island states → Stick states (unique files only):
@@ -16,4 +16,5 @@ Island states → Stick states (unique files only):
 | attention | `*-warning.gif` |
 | dizzy | `*-dragging.gif` |
 
-`dsh` and unknown agents fall back to the Mao pack.
+`dsh` has no Island mascot — Stick maps it to the **Kimi** pack.
+Unknown agents fall back to Mao.

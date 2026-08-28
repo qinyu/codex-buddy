@@ -25,7 +25,8 @@ HOOK_LOG_PATH = STATE_DIR / "hook.log"
 DEFAULT_CONFIG: dict[str, Any] = {
     "name": "Codex-",
     "address": None,
-    "interval": 5.0,
+    # Stick BLE cadence: agent presence / pet state. Quota meters use opencodex_ttl.
+    "interval": 10.0,
     "scan_timeout": 8.0,
     "restart_delay": 5.0,
     "verbose": True,
@@ -33,8 +34,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Usage meters come from OpenCodex provider-quotas; Codex sessions still
     # feed pet activity + Stick PermissionRequest approval via the same bridge.
     "opencodex": True,
-    # Refresh OpenCodex quotas often so Stick meters track upstream updates.
-    "opencodex_ttl": 8.0,
+    # Provider windows are hours/days — minute-scale poll is enough.
+    "opencodex_ttl": 180.0,
     # Ping Island-shaped hooks tee into this unix socket for Agent Hub.
     "agent_hub_sock": str(STATE_DIR / "agent-hub.sock"),
     # Drop agents from the carousel after this many quiet seconds (SessionEnd drops immediately).
