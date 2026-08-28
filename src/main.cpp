@@ -1345,6 +1345,28 @@ static void drawUsageProviderHeader(lgfx::v1::LGFXBase* dst, int x, int w, int y
   }
 }
 
+static void drawUsageAgentChrome(lgfx::v1::LGFXBase* dst, int titleX, int rightX, int y0,
+                                 bool live, const Palette& p) {
+  dst->setTextSize(1);
+  dst->setTextDatum(TL_DATUM);
+  dst->setTextColor(p.textDim, p.bg);
+  dst->drawString(usageTopTitle(), titleX, y0);
+  dst->setTextColor(usagePersonaColor(activeState, p), p.bg);
+  dst->drawString(usagePersonaLabel(activeState), titleX, y0 + 10);
+  dst->setTextDatum(TR_DATUM);
+  // Active agent count (and page) so A-key paging is discoverable.
+  if (tama.codexAgentCount >= 1) {
+    char page[8];
+    uint8_t idx = tama.codexAgentIndex;
+    if (idx >= tama.codexAgentCount) idx = tama.codexAgentCount - 1;
+    snprintf(page, sizeof(page), "%u/%u", (unsigned)(idx + 1), (unsigned)tama.codexAgentCount);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString(page, rightX, y0);
+  }
+  dst->setTextColor(live ? GREEN : HOT, p.bg);
+  dst->drawString(live ? "LIVE" : "WAIT", rightX, y0 + 10);
+}
+
 static void drawUsageDashboard() {
   ensureAgentCharacterPack();
   const Palette& p = characterPalette();
@@ -1354,13 +1376,19 @@ static void drawUsageDashboard() {
   static uint8_t cachedProvCnt = 0xFF;
   static uint8_t cachedMeterCount = 0xFF;
   static uint8_t cachedPersona = 0xFF;
+  static uint8_t cachedAgentIdx = 0xFF;
+  static uint8_t cachedAgentCnt = 0xFF;
+  static char cachedAgentTitle[16] = "";
 
   if (!usageLiveKnown || usageLastLive != live
       || strncmp(cachedUsageLabel, usageProviderTitle(), sizeof(cachedUsageLabel)) != 0
       || cachedProvIdx != tama.codexProviderIndex
       || cachedProvCnt != tama.codexProviderCount
       || cachedMeterCount != tama.codexMeterCount
-      || cachedPersona != (uint8_t)activeState) {
+      || cachedPersona != (uint8_t)activeState
+      || cachedAgentIdx != tama.codexAgentIndex
+      || cachedAgentCnt != tama.codexAgentCount
+      || strncmp(cachedAgentTitle, usageTopTitle(), sizeof(cachedAgentTitle)) != 0) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
@@ -1370,6 +1398,10 @@ static void drawUsageDashboard() {
     cachedProvCnt = tama.codexProviderCount;
     cachedMeterCount = tama.codexMeterCount;
     cachedPersona = (uint8_t)activeState;
+    cachedAgentIdx = tama.codexAgentIndex;
+    cachedAgentCnt = tama.codexAgentCount;
+    strncpy(cachedAgentTitle, usageTopTitle(), sizeof(cachedAgentTitle) - 1);
+    cachedAgentTitle[sizeof(cachedAgentTitle) - 1] = 0;
   }
 
   spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
@@ -1388,15 +1420,7 @@ static void drawUsageDashboard() {
 
   if (usageFullPushNeeded) {
     spr.fillRect(0, 0, W, USAGE_PET_TOP, p.bg);
-    spr.setTextSize(1);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(p.textDim, p.bg);
-    spr.drawString(usageTopTitle(), 8, 4);
-    spr.setTextColor(usagePersonaColor(activeState, p), p.bg);
-    spr.drawString(usagePersonaLabel(activeState), 8, 14);
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(live ? GREEN : HOT, p.bg);
-    spr.drawString(live ? "LIVE" : "WAIT", W - 8, 14);
+    drawUsageAgentChrome(&spr, 8, W - 8, 4, live, p);
   }
 
   // Usage block: provider name + page, then meter rows.
@@ -1416,12 +1440,18 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedProvCntLand = 0xFF;
   static char cachedUsageLabelLand[16] = "";
   static uint8_t cachedPersonaLand = 0xFF;
+  static uint8_t cachedAgentIdxLand = 0xFF;
+  static uint8_t cachedAgentCntLand = 0xFF;
+  static char cachedAgentTitleLand[16] = "";
 
   if (!usageLiveKnown || usageLastLive != live
       || strncmp(cachedUsageLabelLand, usageProviderTitle(), sizeof(cachedUsageLabelLand)) != 0
       || cachedProvIdxLand != tama.codexProviderIndex
       || cachedProvCntLand != tama.codexProviderCount
-      || cachedPersonaLand != (uint8_t)activeState) {
+      || cachedPersonaLand != (uint8_t)activeState
+      || cachedAgentIdxLand != tama.codexAgentIndex
+      || cachedAgentCntLand != tama.codexAgentCount
+      || strncmp(cachedAgentTitleLand, usageTopTitle(), sizeof(cachedAgentTitleLand)) != 0) {
     usageLiveKnown = true;
     usageLastLive = live;
     usageFullPushNeeded = true;
@@ -1430,6 +1460,10 @@ static void drawUsageDashboardLandscape() {
     cachedProvIdxLand = tama.codexProviderIndex;
     cachedProvCntLand = tama.codexProviderCount;
     cachedPersonaLand = (uint8_t)activeState;
+    cachedAgentIdxLand = tama.codexAgentIndex;
+    cachedAgentCntLand = tama.codexAgentCount;
+    strncpy(cachedAgentTitleLand, usageTopTitle(), sizeof(cachedAgentTitleLand) - 1);
+    cachedAgentTitleLand[sizeof(cachedAgentTitleLand) - 1] = 0;
   }
 
   M5.Lcd.setRotation(clockOrient);
@@ -1465,15 +1499,7 @@ static void drawUsageDashboardLandscape() {
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(p.textDim, p.bg);
-    M5.Lcd.drawString(usageTopTitle(), rightX, 4);
-    M5.Lcd.setTextColor(usagePersonaColor(activeState, p), p.bg);
-    M5.Lcd.drawString(usagePersonaLabel(activeState), rightX, 14);
-    M5.Lcd.setTextDatum(TR_DATUM);
-    M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
-    M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 14);
+    drawUsageAgentChrome(&M5.Lcd, rightX, lw - 8, 4, live, p);
     cachedLive = live;
     cachedOrient = clockOrient;
   }
