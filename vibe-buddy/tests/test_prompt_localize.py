@@ -6,7 +6,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from prompt_localize import (
+from vibe_buddy.localize import (
     PLACEHOLDER,
     fit_chars,
     is_ascii_only,
@@ -39,8 +39,8 @@ class AsciiPassthroughTests(unittest.TestCase):
         self.assertFalse(is_ascii_only("请批准删除文件"))
 
     def test_ascii_skips_translators(self) -> None:
-        with mock.patch("prompt_localize._mymemory_translate") as mm:
-            with mock.patch("prompt_localize._argos_translate") as ag:
+        with mock.patch("vibe_buddy.localize._mymemory_translate") as mm:
+            with mock.patch("vibe_buddy.localize._argos_translate") as ag:
                 out = translate_for_stick("ls -la /tmp", mode="auto")
         self.assertEqual(out, "ls -la /tmp")
         mm.assert_not_called()
@@ -51,9 +51,9 @@ class PipelineTests(unittest.TestCase):
     def test_mymemory_primary(self) -> None:
         cache: dict[str, str] = {}
         with mock.patch(
-            "prompt_localize._mymemory_translate", return_value="Please delete the file"
+            "vibe_buddy.localize._mymemory_translate", return_value="Please delete the file"
         ) as mm:
-            with mock.patch("prompt_localize._argos_translate") as ag:
+            with mock.patch("vibe_buddy.localize._argos_translate") as ag:
                 out = translate_for_stick(
                     "请删除文件", mode="auto", timeout_ms=500, cache=cache
                 )
@@ -63,9 +63,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_argos_fallback(self) -> None:
         cache: dict[str, str] = {}
-        with mock.patch("prompt_localize._mymemory_translate", return_value=None):
+        with mock.patch("vibe_buddy.localize._mymemory_translate", return_value=None):
             with mock.patch(
-                "prompt_localize._argos_translate", return_value="Please delete the file"
+                "vibe_buddy.localize._argos_translate", return_value="Please delete the file"
             ) as ag:
                 out = translate_for_stick("请删除文件", mode="auto", cache=cache)
         self.assertEqual(out, "Please delete the file")
@@ -73,16 +73,16 @@ class PipelineTests(unittest.TestCase):
 
     def test_placeholder_last_resort(self) -> None:
         cache: dict[str, str] = {}
-        with mock.patch("prompt_localize._mymemory_translate", return_value=None):
-            with mock.patch("prompt_localize._argos_translate", return_value=None):
-                with mock.patch("prompt_localize._pinyin_fallback", return_value=None):
+        with mock.patch("vibe_buddy.localize._mymemory_translate", return_value=None):
+            with mock.patch("vibe_buddy.localize._argos_translate", return_value=None):
+                with mock.patch("vibe_buddy.localize._pinyin_fallback", return_value=None):
                     out = translate_for_stick("请删除文件", mode="auto", cache=cache)
         self.assertEqual(out, PLACEHOLDER)
 
     def test_cache_avoids_repeat(self) -> None:
         cache: dict[str, str] = {}
         with mock.patch(
-            "prompt_localize._mymemory_translate", return_value="Delete file"
+            "vibe_buddy.localize._mymemory_translate", return_value="Delete file"
         ) as mm:
             a = translate_for_stick("请删除", mode="auto", cache=cache)
             b = translate_for_stick("请删除", mode="auto", cache=cache)
@@ -90,7 +90,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(mm.call_count, 1)
 
     def test_off_mode_uses_placeholder_for_non_ascii(self) -> None:
-        with mock.patch("prompt_localize._mymemory_translate") as mm:
+        with mock.patch("vibe_buddy.localize._mymemory_translate") as mm:
             out = translate_for_stick("请批准", mode="off", cache={})
         self.assertEqual(out, PLACEHOLDER)
         mm.assert_not_called()

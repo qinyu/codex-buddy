@@ -34,11 +34,7 @@ except ImportError:  # pragma: no cover - user-facing dependency path
     BleakClient = None
     BleakScanner = None
 
-try:
-    from prompt_localize import prepare_prompt_fields
-except ImportError:  # pragma: no cover - ensure sibling module is importable
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from prompt_localize import prepare_prompt_fields
+from vibe_buddy.localize import prepare_prompt_fields
 
 
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -2543,8 +2539,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     args.codex_home = args.codex_home.expanduser()
     if args.rollout:
         args.rollout = args.rollout.expanduser()
@@ -2560,7 +2556,10 @@ def main() -> int:
         args.opencodex_token_file = args.opencodex_token_file.expanduser()
 
     if not args.dry_run and (BleakClient is None or BleakScanner is None):
-        print("Missing dependency: bleak. Install with `python3 -m pip install bleak`.", file=sys.stderr)
+        print(
+            "Missing dependency: bleak. Install with `uv tool install -e ./vibe-buddy`.",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -2568,7 +2567,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        print(f"codex_usage_ble_bridge: {exc}", file=sys.stderr)
+        print(f"vibe-buddy bridge: {exc}", file=sys.stderr)
         return 1
     return 0
 

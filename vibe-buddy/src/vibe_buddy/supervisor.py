@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Start the Codex Usage Stick BLE bridge once per user session."""
+"""Supervise the Vibe Buddy BLE bridge once per user session."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import signal
@@ -13,44 +12,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-BRIDGE_SCRIPT = PLUGIN_ROOT / "scripts" / "codex_usage_ble_bridge.py"
-STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
-CONFIG_PATH = STATE_DIR / "config.json"
-PID_PATH = STATE_DIR / "bridge.pid"
-LOG_PATH = STATE_DIR / "bridge.log"
-HOOK_LOG_PATH = STATE_DIR / "hook.log"
-
-DEFAULT_CONFIG: dict[str, Any] = {
-    "name": "Codex-",
-    "address": None,
-    # Stick BLE cadence: agent presence / pet state. Quota meters use opencodex_ttl.
-    "interval": 10.0,
-    "scan_timeout": 8.0,
-    "restart_delay": 5.0,
-    "verbose": True,
-    "no_approval_proxy": True,
-    # Usage meters come from OpenCodex provider-quotas; Codex sessions still
-    # feed pet activity + Stick PermissionRequest approval via the same bridge.
-    "opencodex": True,
-    # Provider windows are hours/days — minute-scale poll is enough.
-    "opencodex_ttl": 180.0,
-    # Ping Island-shaped hooks tee into this unix socket for Agent Hub.
-    "agent_hub_sock": str(STATE_DIR / "agent-hub.sock"),
-    # Drop agents from the carousel after this many quiet seconds (SessionEnd drops immediately).
-    "agent_recent_window": 300.0,
-    # Stick approval ZH→EN (issue #11). ASCII passthrough; fail-open.
-    "prompt_translate": "auto",
-    "prompt_translate_timeout_ms": 600,
-    "mymemory_email": None,
-}
+from vibe_buddy.paths import (
+    CONFIG_PATH,
+    DEFAULT_CONFIG,
+    HOOK_LOG_PATH,
+    LOG_PATH,
+    PID_PATH,
+    ensure_state_dir,
+)
 
 SHUTDOWN = False
-
-
-def ensure_state_dir() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> dict[str, Any]:
@@ -94,8 +65,18 @@ def running_pid() -> int | None:
     return None
 
 
+def _vibe_buddy_argv() -> list[str]:
+    """Prefer installed console script; fall back to `python -m vibe_buddy`."""
+    from shutil import which
+
+    exe = which("vibe-buddy")
+    if exe:
+        return [exe]
+    return [sys.executable, "-m", "vibe_buddy"]
+
+
 def bridge_command(cfg: dict[str, Any]) -> list[str]:
-    cmd = [sys.executable, str(BRIDGE_SCRIPT)]
+    cmd = [*_vibe_buddy_argv(), "bridge", "--"]
     name = cfg.get("name")
     if name:
         cmd.extend(["--name", str(name)])
@@ -139,7 +120,7 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
 
 
 def supervisor_command() -> list[str]:
-    return [sys.executable, str(Path(__file__).resolve()), "--supervise"]
+    return [*_vibe_buddy_argv(), "start", "--supervise"]
 
 
 def request_shutdown(_signum: int, _frame: object) -> None:
@@ -153,7 +134,7 @@ def supervise_bridge() -> int:
 
     while not SHUTDOWN:
         cfg = load_config()
-        proc = subprocess.Popen(bridge_command(cfg), cwd=str(PLUGIN_ROOT))
+        proc = subprocess.Popen(bridge_command(cfg))
         while proc.poll() is None:
             if SHUTDOWN:
                 proc.terminate()
@@ -171,11 +152,9 @@ def supervise_bridge() -> int:
 
 def start_bridge(foreground: bool = False) -> int:
     cfg = load_config()
-    if not BRIDGE_SCRIPT.exists():
-        return 2
 
     if foreground:
-        return subprocess.call(bridge_command(cfg), cwd=str(PLUGIN_ROOT))
+        return subprocess.call(bridge_command(cfg))
 
     pid = running_pid()
     if pid is not None:
@@ -187,7 +166,6 @@ def start_bridge(foreground: bool = False) -> int:
     with LOG_PATH.open("ab") as log:
         proc = subprocess.Popen(
             supervisor_command(),
-            cwd=str(PLUGIN_ROOT),
             stdout=log,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -196,6 +174,11 @@ def start_bridge(foreground: bool = False) -> int:
         )
     PID_PATH.write_text(f"{proc.pid}\n")
     return 0
+
+
+def ensure_running() -> int:
+    """Idempotent start for hooks."""
+    return start_bridge(foreground=False)
 
 
 def stop_bridge() -> int:
@@ -217,25 +200,32 @@ def status() -> int:
     cfg = load_config()
     pid = running_pid()
     state = "running" if pid is not None else "stopped"
-    print(json.dumps({
-        "state": state,
-        "pid": pid,
-        "config": str(CONFIG_PATH),
-        "log": str(LOG_PATH),
-        "hook_log": str(HOOK_LOG_PATH),
-        "command": supervisor_command(),
-        "bridge_command": bridge_command(cfg),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "state": state,
+                "pid": pid,
+                "config": str(CONFIG_PATH),
+                "log": str(LOG_PATH),
+                "hook_log": str(HOOK_LOG_PATH),
+                "command": supervisor_command(),
+                "bridge_command": bridge_command(cfg),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Start/stop the Codex Usage Stick BLE bridge.")
-    parser.add_argument("--foreground", action="store_true", help="Run the bridge in the foreground")
-    parser.add_argument("--status", action="store_true", help="Print bridge status")
-    parser.add_argument("--stop", action="store_true", help="Stop the bridge")
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Start/stop the Vibe Buddy BLE bridge.")
+    parser.add_argument("--foreground", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--stop", action="store_true")
     parser.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.supervise:
         return supervise_bridge()

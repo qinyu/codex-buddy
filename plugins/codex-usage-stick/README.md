@@ -1,12 +1,22 @@
 # Codex Usage Stick Plugin
 
-This local Codex plugin starts a BLE bridge that sends Codex usage data to a
-StickS3 running the matching Codex Usage Stick firmware.
+This local Codex plugin talks to StickS3 via the **vibe-buddy** PC package
+(BLE bridge, approval hooks, Agent Hub).
+
+Install the package first (hooks call the installed CLI, not repo script paths):
+
+```bash
+cd vibe-buddy && uv tool install -e .
+# or: pip install -e ./vibe-buddy  (e.g. into this repo's .venv)
+which vibe-buddy
+vibe-buddy setup-hooks                 # cursor+pi+hermes+codex
+vibe-buddy setup-hooks --agent cursor  # one agent
+```
 
 The plugin is local-first:
 
 - It reads local Codex usage files.
-- It starts one background bridge process.
+- It starts one background bridge process (`vibe-buddy start`).
 - It sends compact usage packets over BLE.
 - It writes diagnostics under `~/.codex/codex-usage-bridge/`.
 - It does not send data to an external server.
@@ -24,13 +34,12 @@ PermissionRequest
 The hooks run:
 
 ```sh
-python3 "$PLUGIN_ROOT/scripts/hook_entry.py"
+vibe-buddy hook --event <EventName>
 ```
 
-The startup hooks return quickly: `hook_entry.py` writes a log line and asks
-`start_bridge.py` to start or reuse the background bridge. The
-`PermissionRequest` hook is synchronous and waits briefly for A/B on the
-StickS3 before falling back to Codex's normal approval UI.
+Startup hooks return quickly after ensuring the bridge is running. The
+`PermissionRequest` hook waits briefly for A/B on the StickS3 before falling
+back to Codex's normal approval UI.
 
 ## Install From Codex UI
 

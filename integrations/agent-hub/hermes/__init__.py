@@ -7,10 +7,10 @@ import os
 import subprocess
 import threading
 
-# NOTIFY path placeholder filled by install_presence.py.
+# Absolute path to vibe-buddy filled by install_presence.py.
 NOTIFY = [
-    "python3",
-    "__CODEX_BUDDY_NOTIFY__",
+    "__VIBE_BUDDY__",
+    "post",
     "--client-kind",
     "hermes",
     "--client-name",

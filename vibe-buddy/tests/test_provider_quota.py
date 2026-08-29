@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from codex_usage_ble_bridge import (
+from vibe_buddy.bridge import (
     UsageSnapshot,
     bar_is_visible,
     map_provider_quota,

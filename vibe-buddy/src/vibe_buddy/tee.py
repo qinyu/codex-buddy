@@ -3,8 +3,7 @@
 
 Usage (as a hook command replacement):
 
-  … | tools/agent_hub_hook_tee.py -- \\
-        ~/.ping-island/bin/ping-island-bridge --source codex
+  vibe-buddy tee -- ~/.ping-island/bin/ping-island-bridge --source codex
 
 Identity flags after `--` are copied into the Agent Hub envelope.
 The same stdin JSON is forwarded unchanged to the Island bridge process.
@@ -21,8 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_HUB_SOCK = Path.home() / ".codex" / "codex-usage-bridge" / "agent-hub.sock"
+from vibe_buddy.paths import AGENT_HUB_SOCK_PATH
 
 
 def parse_identity(argv: list[str]) -> dict[str, Any]:
@@ -59,12 +57,12 @@ def send_hub(sock_path: Path, envelope: dict[str, Any]) -> None:
             reader.readline()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--agent-hub-sock",
         type=Path,
-        default=Path(os.environ.get("CODEX_AGENT_HUB_SOCK", DEFAULT_HUB_SOCK)),
+        default=Path(os.environ.get("CODEX_AGENT_HUB_SOCK", AGENT_HUB_SOCK_PATH)),
     )
     parser.add_argument(
         "--island-only",
@@ -77,13 +75,13 @@ def main() -> int:
         help="Skip Island bridge delivery (debug)",
     )
     parser.add_argument("bridge_argv", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     bridge_argv = list(args.bridge_argv)
     if bridge_argv and bridge_argv[0] == "--":
         bridge_argv = bridge_argv[1:]
     if not bridge_argv and not args.hub_only:
-        print("agent_hub_hook_tee: missing Island bridge command after --", file=sys.stderr)
+        print("vibe-buddy tee: missing Island bridge command after --", file=sys.stderr)
         return 2
 
     raw = sys.stdin.buffer.read()

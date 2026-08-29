@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from codex_usage_ble_bridge import AgentHub, UsageSnapshot, resolve_agent_id, state_from_hook_event
+from vibe_buddy.bridge import AgentHub, UsageSnapshot, resolve_agent_id, state_from_hook_event
 
 
 def _snap(**kwargs: object) -> UsageSnapshot:
