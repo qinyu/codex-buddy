@@ -913,13 +913,16 @@ static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t
 
 static void drawApproval() {
   const Palette& p = characterPalette();
-  const int AREA = 78;
-  spr.fillRect(0, H - AREA, W, AREA, p.bg);
-  spr.drawFastHLine(0, H - AREA, W, p.textDim);
+  // Cover the entire usage/provider block so the screen stays two panes:
+  // pet chrome above, approval below (same band as meters).
+  const int top = USAGE_PET_BOTTOM;
+  const int AREA = H - top;
+  spr.fillRect(0, top, W, AREA, p.bg);
+  spr.drawFastHLine(0, top, W, p.textDim);
 
   spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(4, H - AREA + 4);
+  spr.setCursor(4, top + 4);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
   spr.printf("approve? %lus", (unsigned long)waited);
@@ -928,31 +931,42 @@ static void drawApproval() {
   int toolLen = strlen(tama.promptTool);
   spr.setTextColor(p.text, p.bg);
   spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
+  spr.setCursor(4, top + (toolLen <= 10 ? 18 : 22));
   spr.print(tama.promptTool);
   spr.setTextSize(1);
 
-  // Hint wraps at ~21 chars to two lines under the tool name
+  // Hint wraps at ~21 chars; taller panel allows a third line.
   spr.setTextColor(p.textDim, p.bg);
   int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
+  int hintY = top + 42;
+  spr.setCursor(4, hintY);
   spr.printf("%.21s", tama.promptHint);
   if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
+    spr.setCursor(4, hintY + 10);
     spr.printf("%.21s", tama.promptHint + 21);
   }
+  if (hlen > 42) {
+    spr.setCursor(4, hintY + 20);
+    spr.printf("%.21s", tama.promptHint + 42);
+  }
 
+  // Physical layout: BtnA below screen, BtnB on the right edge → ↓ / →.
+  const int hy = H - 14;
   if (responseSent) {
     spr.setTextColor(p.textDim, p.bg);
-    spr.setCursor(4, H - 12);
+    spr.setCursor(4, hy);
     spr.print("sent...");
   } else {
     spr.setTextColor(GREEN, p.bg);
-    spr.setCursor(4, H - 12);
-    spr.print("A: accept");
+    spr.setCursor(4, hy);
+    spr.print("accept");
+    spr.fillTriangle(4 + 6 * 6 + 4, hy + 1, 4 + 6 * 6 + 10, hy + 1, 4 + 6 * 6 + 7, hy + 6, GREEN);
+
     spr.setTextColor(HOT, p.bg);
-    spr.setCursor(W - 54, H - 12);
-    spr.print("B: cancel");
+    int rx = W - 8 - 6 * 6 - 10;
+    spr.setCursor(rx, hy);
+    spr.print("cancel");
+    spr.fillTriangle(W - 10, hy, W - 10, hy + 6, W - 5, hy + 3, HOT);
   }
 }
 

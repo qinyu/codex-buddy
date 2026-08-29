@@ -40,6 +40,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent_hub_sock": str(STATE_DIR / "agent-hub.sock"),
     # Drop agents from the carousel after this many quiet seconds (SessionEnd drops immediately).
     "agent_recent_window": 300.0,
+    # Stick approval ZH→EN (issue #11). ASCII passthrough; fail-open.
+    "prompt_translate": "auto",
+    "prompt_translate_timeout_ms": 600,
+    "mymemory_email": None,
 }
 
 SHUTDOWN = False
@@ -121,6 +125,16 @@ def bridge_command(cfg: dict[str, Any]) -> list[str]:
         cmd.extend(["--agent-hub-sock", str(hub_sock)])
     if cfg.get("agent_recent_window") is not None:
         cmd.extend(["--agent-recent-window", str(cfg["agent_recent_window"])])
+    prompt_translate = cfg.get("prompt_translate", "auto")
+    if prompt_translate:
+        cmd.extend(["--prompt-translate", str(prompt_translate)])
+    if cfg.get("prompt_translate_timeout_ms") is not None:
+        cmd.extend(
+            ["--prompt-translate-timeout-ms", str(cfg["prompt_translate_timeout_ms"])]
+        )
+    mymemory_email = cfg.get("mymemory_email")
+    if mymemory_email:
+        cmd.extend(["--mymemory-email", str(mymemory_email)])
     return cmd
 
 

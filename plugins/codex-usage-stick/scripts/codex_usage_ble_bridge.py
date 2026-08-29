@@ -34,6 +34,12 @@ except ImportError:  # pragma: no cover - user-facing dependency path
     BleakClient = None
     BleakScanner = None
 
+try:
+    from prompt_localize import prepare_prompt_fields
+except ImportError:  # pragma: no cover - ensure sibling module is importable
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from prompt_localize import prepare_prompt_fields
+
 
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -1674,10 +1680,17 @@ def choose_state(args: argparse.Namespace, snapshot: UsageSnapshot, tracker: Act
 
 
 def short_text(value: Any, fallback: str, limit: int) -> str:
+    """Truncate by Unicode characters; stay within `limit` including `...`."""
     text = str(value or fallback).replace("\n", " ").strip()
+    if not text:
+        text = fallback
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 1)] + "..."
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
 
 
 def provider_display_label(value: Any, fallback: str = "", limit: int = 15) -> str:
@@ -1978,6 +1991,8 @@ class CodexApprovalProxy:
     def _prompt_text(self, req: dict[str, Any]) -> tuple[str, str]:
         method = req["method"]
         params = req["params"]
+        # Keep roomy intermediates; localize + fit_chars happen in _show_next_prompt.
+        raw_limit = 240
 
         if method == "hookPermissionRequest":
             if not isinstance(params, dict):
@@ -1999,24 +2014,24 @@ class CodexApprovalProxy:
                 hint = tool_input
             if not hint:
                 hint = params.get("cwd") or "Codex permission request"
-            return tool, short_text(hint, "Codex permission request", 43)
+            return tool, short_text(hint, "Codex permission request", raw_limit)
 
         if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
             command = params.get("command") or ""
             if isinstance(command, list):
                 command = " ".join(str(x) for x in command)
-            return "COMMAND", short_text(params.get("reason") or command, "command approval", 43)
+            return "COMMAND", short_text(params.get("reason") or command, "command approval", raw_limit)
 
         if method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
             hint = params.get("reason") or params.get("grantRoot") or "file change approval"
-            return "FILE CHANGE", short_text(hint, "file change approval", 43)
+            return "FILE CHANGE", short_text(hint, "file change approval", raw_limit)
 
         if method == "item/permissions/requestApproval":
             hint = params.get("reason") or "extra permissions"
-            return "PERMISSIONS", short_text(hint, "extra permissions", 43)
+            return "PERMISSIONS", short_text(hint, "extra permissions", raw_limit)
 
         if method == "testApproval":
-            return "TEST", short_text(params.get("reason"), "A accept / B cancel", 43)
+            return "TEST", short_text(params.get("reason"), "A accept / B cancel", raw_limit)
 
         return "APPROVAL", "Codex approval"
 
@@ -2029,12 +2044,22 @@ class CodexApprovalProxy:
         prompt_id = self.pending_order[0]
         self.active_prompt_id = prompt_id
         tool, hint = self._prompt_text(self.pending[prompt_id])
+        tool, hint = prepare_prompt_fields(
+            tool,
+            hint,
+            mode=getattr(self.args, "prompt_translate", "auto"),
+            timeout_ms=int(getattr(self.args, "prompt_translate_timeout_ms", 600) or 600),
+            mymemory_email=getattr(self.args, "mymemory_email", None) or None,
+            tool_limit=19,
+            # Device promptHint[64] → 63 usable chars (3×21 portrait lines).
+            hint_limit=63,
+        )
         await self.ble.write_json(
             {
                 "prompt": {
                     "id": prompt_id,
-                    "tool": short_text(tool, "APPROVAL", 19),
-                    "hint": short_text(hint, "Codex approval", 43),
+                    "tool": tool,
+                    "hint": hint,
                 },
                 "msg": "Codex approval",
             }
@@ -2497,6 +2522,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-process-presence",
         action="store_true",
         help="Do not keep agents visible based on open IDE/service processes",
+    )
+    p.add_argument(
+        "--prompt-translate",
+        choices=("auto", "off"),
+        default="auto",
+        help="Localize non-ASCII Stick approval hints (MyMemory→Argos→placeholder)",
+    )
+    p.add_argument(
+        "--prompt-translate-timeout-ms",
+        type=int,
+        default=600,
+        help="MyMemory HTTP timeout for approval hint translation",
+    )
+    p.add_argument(
+        "--mymemory-email",
+        default=None,
+        help="Optional MyMemory `de` email for higher daily char quota",
     )
     return p
 

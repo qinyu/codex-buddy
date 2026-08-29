@@ -138,7 +138,10 @@ Default `config.json`:
   "verbose": true,
   "no_approval_proxy": true,
   "opencodex": true,
-  "agent_hub_sock": "~/.codex/codex-usage-bridge/agent-hub.sock"
+  "agent_hub_sock": "~/.codex/codex-usage-bridge/agent-hub.sock",
+  "prompt_translate": "auto",
+  "prompt_translate_timeout_ms": 600,
+  "mymemory_email": null
 }
 ```
 
@@ -146,6 +149,12 @@ Use `address` if macOS BLE name caching makes name scanning unreliable.
 `no_approval_proxy` only disables the older app-server proxy experiment.
 StickS3 approve/deny uses the `PermissionRequest` hook plus the local
 `approval.sock` bridge and works with this value set to `true`.
+
+Non-ASCII approval hints (typical Chinese) are localized on the Mac before BLE:
+MyMemory → Argos `zh→en` → placeholder. Pure ASCII commands pass through
+unchanged. Optional deps: `argostranslate` (+ installed `zh→en` model),
+`pypinyin`. Set `prompt_translate` to `off` to skip translators and show a
+placeholder for non-ASCII (Stick has no CJK font).
 
 ## Commands
 
@@ -221,7 +230,8 @@ sent {"state":"busy","tokens":...,"primary":...,"secondary":...}
 ## Approve / Deny
 
 When Codex asks for a permission approval, the bridge forwards the prompt to
-the StickS3 through a local `PermissionRequest` hook. Press A to allow or B to
-deny. If the StickS3 is not connected or no button is pressed before timeout,
+the StickS3 through a local `PermissionRequest` hook. The approval panel covers
+the usage band; footer shows **accept ↓** (BtnA) and **cancel →** (BtnB).
+If the StickS3 is not connected or no button is pressed before timeout,
 the hook returns no decision and Codex falls back to its normal local approval
 flow.
