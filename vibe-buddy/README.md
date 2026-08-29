@@ -49,6 +49,17 @@ Catalog (detection cues): Cursor, Codex, Claude Code, Pi, Hermes, DSH
 
 `setup-hooks` writes absolute paths from `which vibe-buddy`, not repo scripts.
 
+## Login autostart (macOS)
+
+```bash
+vibe-buddy setup-autostart           # LaunchAgent: start bridge at login
+vibe-buddy setup-autostart --status
+vibe-buddy setup-autostart --uninstall
+```
+
+Installs `~/Library/LaunchAgents/com.vibe-buddy.bridge.plist` with `RunAtLoad`
+and `KeepAlive` so the supervisor comes back if it exits.
+
 ## OpenCodex (quota meters)
 
 No OpenCodex config changes are required for Agent Hub / hooks.
@@ -60,3 +71,7 @@ Vibe Buddy **pulls** provider quotas from a running OpenCodex admin API:
 - Bridge config: `"opencodex": true` in `~/.codex/codex-usage-bridge/config.json`
 
 Keep OpenCodex running locally; optional overrides: `opencodex_url`, `opencodex_token_file`, `opencodex_ttl`.
+
+The bridge polls quotas on the PC on its normal interval (and reuses them for
+`opencodex_ttl` seconds). Stick provider/agent page turns only flip the cached
+index and push over BLE — they do not re-hit OpenCodex on every press.

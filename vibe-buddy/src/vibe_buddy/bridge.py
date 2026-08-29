@@ -223,14 +223,12 @@ def state_from_hook_event(event_name: str) -> str | None:
         "beforesubmitprompt",
         "pretooluse",
         "posttooluse",
-        "posttoolusefailure",
         "notification",
         "precompact",
         "postcompact",
         "afteragentresponse",
         "afteragentthought",
         "subagentstart",
-        "subagentstop",
         "beforeshellexecution",
         "aftershellexecution",
         "beforemcpexecution",
@@ -238,11 +236,51 @@ def state_from_hook_event(event_name: str) -> str | None:
         "afterfileedit",
     }:
         return "busy"
+    if key in {"posttoolusefailure"}:
+        return "error"
     if key in {"sessionend"}:
         return "gone"  # leave the carousel entirely
-    if key in {"stop", "sessionstart"}:
+    if key in {"stop", "subagentstop"}:
+        return "completed"
+    if key in {"sessionstart"}:
         return "idle"
     return None
+
+
+def notice_kind_from_hook(event_name: str, flat: dict[str, Any]) -> str | None:
+    """Map host hooks to Stick confirm-only notices: done | error."""
+    key = re.sub(r"[^a-z]", "", event_name.strip().lower())
+    if key in {"stop", "subagentstop"}:
+        return "done"
+    if key in {"posttoolusefailure"}:
+        return "error"
+    if key == "notification":
+        blob = " ".join(
+            str(flat.get(k) or "")
+            for k in (
+                "notification_type",
+                "type",
+                "title",
+                "message",
+                "content",
+                "status",
+            )
+        ).lower()
+        if any(w in blob for w in ("error", "fail", "fatal", "exception")):
+            return "error"
+        if any(w in blob for w in ("complete", "done", "finished", "success")):
+            return "done"
+    return None
+
+
+def notice_hint_from_hook(flat: dict[str, Any], kind: str) -> str:
+    for key in ("message", "title", "content", "text", "error", "reason", "summary"):
+        value = flat.get(key)
+        if isinstance(value, str) and value.strip():
+            return short_text(value, kind, 63)
+    if kind == "error":
+        return "agent error"
+    return "task complete"
 
 
 def flatten_hook_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -271,6 +309,15 @@ class HubAgent:
     session_id: str | None = None
     from_hook: bool = False
     from_process: bool = False
+
+
+@dataclass
+class StickNotice:
+    kind: str  # done | error
+    agent_id: str
+    title: str
+    hint: str
+    at: float = 0.0
 
 
 # Open IDE / service → show on Stick.
@@ -410,6 +457,52 @@ class AgentHub:
         self.manual_grace_until = 0.0
         self._rotate_started_at = time.time()
         self._ipc_server: asyncio.AbstractServer | None = None
+        self._stick_notices: list[StickNotice] = []
+        self._notice_dedupe: dict[str, float] = {}
+
+    def queue_notice(
+        self,
+        kind: str,
+        agent_id: str,
+        title: str,
+        hint: str,
+        now: float | None = None,
+        *,
+        dedupe_sec: float = 25.0,
+    ) -> None:
+        now = time.time() if now is None else now
+        key = f"{kind}:{normalize_agent_id(agent_id)}:{hint[:48]}"
+        last = self._notice_dedupe.get(key)
+        if last is not None and now - last < dedupe_sec:
+            return
+        self._notice_dedupe[key] = now
+        self._stick_notices.append(
+            StickNotice(
+                kind=kind,
+                agent_id=normalize_agent_id(agent_id) or "codex",
+                title=short_text(title, kind.upper(), 19),
+                hint=short_text(hint, kind, 63),
+                at=now,
+            )
+        )
+
+    def pop_notices(self) -> list[StickNotice]:
+        out = self._stick_notices
+        self._stick_notices = []
+        return out
+
+    def select_agent(self, agent_id: str, now: float | None = None) -> HubAgent | None:
+        """Focus an agent (and its Stick pet) when a notice/approval arrives."""
+        now = time.time() if now is None else now
+        aid = normalize_agent_id(agent_id) or "codex"
+        agent = self.ensure_agent(aid)
+        agent.last_event_at = now
+        if aid not in self.order:
+            self.order.append(aid)
+        self.current_id = aid
+        self._rotate_started_at = now
+        self.manual_grace_until = now + self.manual_grace_sec
+        return agent
 
     def ensure_agent(self, agent_id: str, payload: dict[str, Any] | None = None) -> HubAgent:
         aid = normalize_agent_id(agent_id) or "codex"
@@ -452,7 +545,8 @@ class AgentHub:
         flat = flatten_hook_payload(payload)
         now = time.time() if now is None else now
         agent_id = resolve_agent_id(flat)
-        mapped = state_from_hook_event(hook_event_name(flat))
+        event = hook_event_name(flat)
+        mapped = state_from_hook_event(event)
         if mapped == "gone":
             self.drop_agent(agent_id)
             return None
@@ -475,10 +569,27 @@ class AgentHub:
             agent.state = "completed"
             agent.last_completed_at = now
             agent.last_busy_at = None
+        elif mapped == "error":
+            # Keep agent visible as busy-ish; Stick shows confirm-only error panel.
+            agent.state = "busy"
+            agent.last_busy_at = now
         elif mapped == "idle":
             agent.state = "idle"
             agent.last_busy_at = None
-        # Unknown events still refresh last_event_at so the agent stays present.
+
+        notice_kind = notice_kind_from_hook(event, flat)
+        if notice_kind is None and mapped == "error":
+            notice_kind = "error"
+        if notice_kind is None and mapped == "completed":
+            notice_kind = "done"
+        if notice_kind:
+            self.queue_notice(
+                notice_kind,
+                agent.agent_id,
+                agent.title,
+                notice_hint_from_hook(flat, notice_kind),
+                now,
+            )
         return agent
 
     def note_codex_fallback(self, state: str, now: float | None = None) -> HubAgent | None:
@@ -496,6 +607,7 @@ class AgentHub:
                     agent.last_attention_at = now
             elif state == "completed":
                 agent.last_completed_at = now
+                self.queue_notice("done", "codex", agent.title, "task complete", now)
             return agent
         # idle/sleep must not keep refreshing presence; let prune drop it.
         agent = self.agents.get("codex")
@@ -1543,8 +1655,16 @@ def read_codex_activity_snapshot(args: argparse.Namespace) -> UsageSnapshot | No
         return None
 
 
-def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) -> UsageSnapshot:
-    store.fetch_reports(force=False)
+def read_opencodex_usage(
+    args: argparse.Namespace,
+    store: OpenCodexProviders,
+    *,
+    allow_fetch: bool = True,
+    include_activity: bool = True,
+    activity_fallback: UsageSnapshot | None = None,
+) -> UsageSnapshot:
+    if allow_fetch or not store.reports:
+        store.fetch_reports(force=False)
     report = store.current_report()
     quota = report.get("quota") or {}
     view = map_provider_quota(quota)
@@ -1553,9 +1673,23 @@ def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) ->
     tertiary_bar = view.tertiary
     show_secondary = view.meter_count >= 2 and bar_is_visible(secondary_bar)
 
-    activity = read_codex_activity_snapshot(args)
-    tokens = activity.tokens if activity else 0
-    event_ts = activity.event_ts if activity else None
+    activity = read_codex_activity_snapshot(args) if include_activity else None
+    if activity is None and activity_fallback is not None:
+        tokens = activity_fallback.tokens
+        event_ts = activity_fallback.event_ts
+        task_started_at = activity_fallback.task_started_at
+        task_complete_at = activity_fallback.task_complete_at
+        attention_at = activity_fallback.attention_at
+        dizzy_at = activity_fallback.dizzy_at
+        last_activity_at = activity_fallback.last_activity_at
+    else:
+        tokens = activity.tokens if activity else 0
+        event_ts = activity.event_ts if activity else None
+        task_started_at = activity.task_started_at if activity else None
+        task_complete_at = activity.task_complete_at if activity else None
+        attention_at = activity.attention_at if activity else None
+        dizzy_at = activity.dizzy_at if activity else None
+        last_activity_at = activity.last_activity_at if activity else None
 
     provider = str(report.get("provider") or "")
     label = str(report.get("label") or provider)
@@ -1569,11 +1703,11 @@ def read_opencodex_usage(args: argparse.Namespace, store: OpenCodexProviders) ->
         event_ts=event_ts,
         limit_id=provider or None,
         limit_name=label or None,
-        task_started_at=activity.task_started_at if activity else None,
-        task_complete_at=activity.task_complete_at if activity else None,
-        attention_at=activity.attention_at if activity else None,
-        dizzy_at=activity.dizzy_at if activity else None,
-        last_activity_at=activity.last_activity_at if activity else None,
+        task_started_at=task_started_at,
+        task_complete_at=task_complete_at,
+        attention_at=attention_at,
+        dizzy_at=dizzy_at,
+        last_activity_at=last_activity_at,
         provider=provider or None,
         label=label or None,
         provider_index=store.index,
@@ -1750,9 +1884,15 @@ APPROVAL_METHODS = {
 
 
 class CodexApprovalProxy:
-    def __init__(self, args: argparse.Namespace, ble: BleSession) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        ble: BleSession,
+        hub: AgentHub | None = None,
+    ) -> None:
         self.args = args
         self.ble = ble
+        self.hub = hub
         self.proc: asyncio.subprocess.Process | None = None
         self.pending: dict[str, dict[str, Any]] = {}
         self.pending_order: list[str] = []
@@ -1763,6 +1903,52 @@ class CodexApprovalProxy:
 
     def has_pending(self) -> bool:
         return bool(self.pending)
+
+    async def enqueue_notice(
+        self,
+        kind: str,
+        tool: str,
+        hint: str,
+        *,
+        agent_id: str | None = None,
+        agent_title: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Queue a confirm-only Stick panel (task done / error). Non-blocking for hosts."""
+        wait = float(
+            timeout
+            if timeout is not None
+            else getattr(self.args, "hook_approval_timeout", 45.0) or 45.0
+        )
+        aid = normalize_agent_id(agent_id) or "codex"
+        title = short_text(agent_title or agent_title_for(aid), aid.upper(), 12)
+        prompt_id = f"n{self.next_prompt_num}"
+        self.next_prompt_num += 1
+        self.pending[prompt_id] = {
+            "method": "stickNotice",
+            "kind": kind if kind in {"done", "error"} else "done",
+            "agent_id": aid,
+            "agent_title": title,
+            "rpc_id": None,
+            "params": {"tool": tool, "hint": hint},
+        }
+        self.pending_order.append(prompt_id)
+        if self.args.verbose:
+            print(f"[notice] {kind} {prompt_id} [{aid}]: {tool} — {hint}", file=sys.stderr)
+        if not self.active_prompt_id:
+            await self._show_next_prompt()
+        asyncio.create_task(self._expire_notice(prompt_id, wait))
+
+    async def _expire_notice(self, prompt_id: str, timeout: float) -> None:
+        await asyncio.sleep(max(1.0, timeout))
+        if prompt_id not in self.pending:
+            return
+        self._remove_pending(prompt_id)
+        if self.active_prompt_id == prompt_id:
+            self.active_prompt_id = None
+            if self.args.verbose:
+                print(f"[notice] {prompt_id} timed out", file=sys.stderr)
+            await self._show_next_prompt()
 
     async def start_ipc_server(self) -> None:
         sock = self.args.hook_approval_sock
@@ -1827,6 +2013,8 @@ class CodexApprovalProxy:
         self.next_prompt_num += 1
         self.pending[prompt_id] = {
             "method": "testApproval",
+            "agent_id": "codex",
+            "agent_title": "CODEX",
             "rpc_id": None,
             "params": {"reason": "A accept / B cancel"},
         }
@@ -1839,9 +2027,13 @@ class CodexApprovalProxy:
     async def request_hook_permission(self, hook_payload: dict[str, Any], timeout: float) -> str | None:
         prompt_id = f"h{self.next_prompt_num}"
         self.next_prompt_num += 1
+        flat = flatten_hook_payload(hook_payload if isinstance(hook_payload, dict) else {})
+        aid = resolve_agent_id(flat) if flat else "codex"
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self.pending[prompt_id] = {
             "method": "hookPermissionRequest",
+            "agent_id": aid,
+            "agent_title": agent_title_for(aid, flat),
             "rpc_id": None,
             "params": hook_payload,
             "future": future,
@@ -1849,7 +2041,7 @@ class CodexApprovalProxy:
         self.pending_order.append(prompt_id)
         if self.args.verbose:
             tool = hook_payload.get("tool_name") if isinstance(hook_payload, dict) else None
-            print(f"[approval] hook request {prompt_id}: {tool or 'permission'}", file=sys.stderr)
+            print(f"[approval] hook request {prompt_id} [{aid}]: {tool or 'permission'}", file=sys.stderr)
         if not self.active_prompt_id:
             await self._show_next_prompt()
 
@@ -1975,6 +2167,8 @@ class CodexApprovalProxy:
         params = msg.get("params") or {}
         self.pending[prompt_id] = {
             "method": method,
+            "agent_id": "codex",
+            "agent_title": "CODEX",
             "rpc_id": msg["id"],
             "params": params,
         }
@@ -2039,7 +2233,14 @@ class CodexApprovalProxy:
 
         prompt_id = self.pending_order[0]
         self.active_prompt_id = prompt_id
-        tool, hint = self._prompt_text(self.pending[prompt_id])
+        req = self.pending[prompt_id]
+        kind = "approval"
+        if req.get("method") == "stickNotice":
+            kind = str(req.get("kind") or "done")
+            tool = short_text((req.get("params") or {}).get("tool"), kind.upper(), 19)
+            hint = short_text((req.get("params") or {}).get("hint"), kind, 240)
+        else:
+            tool, hint = self._prompt_text(req)
         tool, hint = prepare_prompt_fields(
             tool,
             hint,
@@ -2050,14 +2251,30 @@ class CodexApprovalProxy:
             # Device promptHint[64] → 63 usable chars (3×21 portrait lines).
             hint_limit=63,
         )
+        agent_id = normalize_agent_id(req.get("agent_id")) or "codex"
+        agent_title = short_text(
+            req.get("agent_title") or agent_title_for(agent_id),
+            agent_id.upper(),
+            12,
+        )
+        if self.hub is not None:
+            self.hub.select_agent(agent_id)
+        msg = {
+            "approval": "Codex approval",
+            "done": "Task complete",
+            "error": "Agent error",
+        }.get(kind, "Codex approval")
         await self.ble.write_json(
             {
                 "prompt": {
                     "id": prompt_id,
                     "tool": tool,
                     "hint": hint,
+                    "kind": kind,
+                    "agent_id": agent_id,
+                    "agent": agent_title,
                 },
-                "msg": "Codex approval",
+                "msg": msg,
             }
         )
 
@@ -2069,7 +2286,9 @@ class CodexApprovalProxy:
 
         prompt_id = str(msg.get("id") or "")
         raw_decision = str(msg.get("decision") or "").lower()
-        if raw_decision in {"accept", "approve", "approved", "once"}:
+        if raw_decision in {"ack", "confirm", "ok"}:
+            decision = "ack"
+        elif raw_decision in {"accept", "approve", "approved", "once"}:
             decision = "accept"
         elif raw_decision in {"cancel", "deny", "denied", "decline", "abort"}:
             decision = "cancel"
@@ -2086,10 +2305,19 @@ class CodexApprovalProxy:
             await self._show_next_prompt()
             return
 
+        if req["method"] == "stickNotice":
+            if self.args.verbose:
+                print(f"[notice] acked {prompt_id}", file=sys.stderr)
+            await self._show_next_prompt()
+            return
+
         if req["method"] == "testApproval":
             print(f"[approval] test decision from StickS3: {decision}", file=sys.stderr)
             await self._show_next_prompt()
             return
+
+        if decision == "ack":
+            decision = "accept"
 
         if req["method"] == "hookPermissionRequest":
             future = req.get("future")
@@ -2215,16 +2443,35 @@ async def send_usage_update(
     approvals: CodexApprovalProxy | None = None,
     opencodex: OpenCodexProviders | None = None,
     force_refresh: bool = False,
+    force_push: bool = False,
     hub: AgentHub | None = None,
     process_presence: ProcessPresence | None = None,
 ) -> None:
+    """Push usage to Stick.
+
+    OpenCodex quotas are polled on the PC (interval / TTL cache). Stick page
+    turns should use ``force_push=True`` with ``force_refresh=False`` so the
+    bridge reuses cached reports and only waits on BLE, not HTTP.
+    """
     if approvals and approvals.has_pending():
         return
 
     if opencodex:
         if force_refresh:
             await asyncio.to_thread(opencodex.fetch_reports, True)
-        snapshot = await asyncio.to_thread(read_opencodex_usage, args, opencodex)
+        # Stick page-turns: serve PC cache only — no OpenCodex HTTP, no
+        # Codex activity/app-server round-trip (those run on the interval).
+        allow_fetch = force_refresh or not force_push
+        include_activity = not force_push
+        fallback = getattr(send_usage_update, "_last_snapshot", None)
+        snapshot = await asyncio.to_thread(
+            read_opencodex_usage,
+            args,
+            opencodex,
+            allow_fetch=allow_fetch,
+            include_activity=include_activity,
+            activity_fallback=fallback if isinstance(fallback, UsageSnapshot) else None,
+        )
     else:
         snapshot = await asyncio.to_thread(read_usage, args)
     if approvals and approvals.has_pending():
@@ -2237,6 +2484,14 @@ async def send_usage_update(
             if alive is not None:
                 hub.sync_process_presence(alive)
         hub.note_codex_fallback(state)
+        # Codex rollout errors → Stick confirm panel (in addition to pet state).
+        if snapshot.dizzy_at and is_recent(snapshot.dizzy_at, 40.0):
+            hub.queue_notice(
+                "error",
+                getattr(snapshot, "agent_id", None) or "codex",
+                getattr(snapshot, "agent", None) or "CODEX",
+                "error / rate limit",
+            )
         hub.maybe_auto_rotate()
         hub_state = hub.apply_to_snapshot(snapshot)
         if hub_state:
@@ -2247,9 +2502,10 @@ async def send_usage_update(
     # Quota windows are slow; skip duplicate BLE writes so Stick UI is not
     # repainted every few seconds with identical meters/chrome.
     last_line = getattr(send_usage_update, "_last_line", None)
-    if not force_refresh and last_line == line:
+    if not force_push and not force_refresh and last_line == line:
         return
     setattr(send_usage_update, "_last_line", line)
+    setattr(send_usage_update, "_last_snapshot", snapshot)
 
     if args.dry_run:
         print(line)
@@ -2311,7 +2567,7 @@ async def bridge_loop(args: argparse.Namespace) -> None:
 
             ble = BleSession(args, client)
             await ble.start_notify()
-            approvals = CodexApprovalProxy(args, ble)
+            approvals = CodexApprovalProxy(args, ble, hub=hub)
             await approvals.start_ipc_server()
             await approvals.start()
             if args.test_approval:
@@ -2347,13 +2603,15 @@ async def bridge_loop(args: argparse.Namespace) -> None:
                                 f"({opencodex.index + 1}/{len(opencodex.reports)})",
                                 file=sys.stderr,
                             )
+                        # Stick page-turn: serve from PC cache (periodic poll
+                        # refreshes OpenCodex). Do not block on HTTP here.
                         await send_usage_update(
                             args,
                             tracker,
                             ble,
                             approvals,
                             opencodex,
-                            force_refresh=True,
+                            force_push=True,
                             hub=hub,
                             process_presence=process_presence,
                         )
@@ -2375,18 +2633,30 @@ async def bridge_loop(args: argparse.Namespace) -> None:
                             ble,
                             approvals,
                             opencodex,
-                            force_refresh=True,
+                            force_push=True,
                             hub=hub,
                             process_presence=process_presence,
                         )
                         continue
                     await approvals.handle_device_message(msg)
 
+            async def notice_pump() -> None:
+                while True:
+                    for notice in hub.pop_notices():
+                        await approvals.enqueue_notice(
+                            notice.kind,
+                            notice.title,
+                            notice.hint,
+                            agent_id=notice.agent_id,
+                            agent_title=notice.title,
+                        )
+                    await asyncio.sleep(0.25)
+
             try:
                 if args.once:
                     await usage_runner()
                     return
-                await asyncio.gather(usage_runner(), device_runner())
+                await asyncio.gather(usage_runner(), device_runner(), notice_pump())
             finally:
                 await approvals.close_ipc_server()
     finally:

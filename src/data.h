@@ -39,9 +39,10 @@ struct TamaState {
   char     lines[8][92];
   uint8_t  nLines;
   uint16_t lineGen;          // bumps when lines change — lets UI reset scroll
-  char     promptId[40];     // pending permission request ID; empty = no prompt
+  char     promptId[40];     // pending permission/notice ID; empty = none
   char     promptTool[20];
   char     promptHint[64];   // up to ~3×21 ASCII lines after PC-side localize
+  char     promptKind[12];   // "approval" | "done" | "error"
 };
 
 // ---------------------------------------------------------------------------
@@ -118,11 +119,31 @@ static void _applyPrompt(JsonVariant v, TamaState* out, bool clearIfNull) {
   JsonObject pr = v.as<JsonObject>();
   if (!pr.isNull()) {
     const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+    const char* pk = pr["kind"];
+    const char* paid = pr["agent_id"];
+    const char* pa = pr["agent"];
     strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
     strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
     strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    if (pk && *pk) {
+      strncpy(out->promptKind, pk, sizeof(out->promptKind)-1);
+      out->promptKind[sizeof(out->promptKind)-1]=0;
+    } else {
+      strncpy(out->promptKind, "approval", sizeof(out->promptKind)-1);
+      out->promptKind[sizeof(out->promptKind)-1]=0;
+    }
+    // Focus the matching agent pet when a notice/approval arrives.
+    if (paid && *paid) {
+      strncpy(out->codexAgentId, paid, sizeof(out->codexAgentId) - 1);
+      out->codexAgentId[sizeof(out->codexAgentId) - 1] = 0;
+    }
+    if (pa && *pa) {
+      strncpy(out->codexAgent, pa, sizeof(out->codexAgent) - 1);
+      out->codexAgent[sizeof(out->codexAgent) - 1] = 0;
+    }
   } else if (clearIfNull) {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+    out->promptKind[0] = 0;
   }
 }
 

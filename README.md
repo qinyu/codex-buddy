@@ -295,7 +295,7 @@ Pet state meanings:
 | `attention` | Codex sent a permission request |
 | `completed` | Task completed |
 | `celebrate` | Reserved for pet upgrades; currently not called |
-| `dizzy` | Triggered by shaking the device |
+| `dizzy` | Shake with a single agent (or menus); multi-agent shake switches agent instead |
 | `heart` | Triggered by pressing B on the normal screen |
 
 Example:

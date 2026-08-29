@@ -132,6 +132,9 @@ def supervise_bridge() -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
 
+    ensure_state_dir()
+    PID_PATH.write_text(f"{os.getpid()}\n")
+
     while not SHUTDOWN:
         cfg = load_config()
         proc = subprocess.Popen(bridge_command(cfg))

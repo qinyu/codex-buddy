@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import unittest
 
-from vibe_buddy.bridge import AgentHub, UsageSnapshot, resolve_agent_id, state_from_hook_event
+from vibe_buddy.bridge import (
+    AgentHub,
+    UsageSnapshot,
+    notice_kind_from_hook,
+    resolve_agent_id,
+    state_from_hook_event,
+)
 
 
 def _snap(**kwargs: object) -> UsageSnapshot:
@@ -57,7 +63,31 @@ class AgentIdentityTests(unittest.TestCase):
         self.assertEqual(state_from_hook_event("UserPromptSubmit"), "busy")
         self.assertEqual(state_from_hook_event("PermissionRequest"), "attention")
         self.assertEqual(state_from_hook_event("SessionEnd"), "gone")
-        self.assertEqual(state_from_hook_event("Stop"), "idle")
+        self.assertEqual(state_from_hook_event("Stop"), "completed")
+        self.assertEqual(state_from_hook_event("PostToolUseFailure"), "error")
+
+    def test_stop_queues_done_notice(self) -> None:
+        hub = AgentHub(presence_window=600)
+        now = 1_700_000_500.0
+        hub.ingest_hook(
+            {"client_kind": "cursor", "hook_event_name": "Stop", "message": "Agent finished"},
+            now=now,
+        )
+        notices = hub.pop_notices()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].kind, "done")
+        self.assertEqual(notices[0].agent_id, "cursor")
+        selected = hub.select_agent("cursor", now=now + 1)
+        self.assertIsNotNone(selected)
+        self.assertEqual(hub.current_id, "cursor")
+
+    def test_notice_kind_from_hook(self) -> None:
+        self.assertEqual(notice_kind_from_hook("Stop", {}), "done")
+        self.assertEqual(notice_kind_from_hook("PostToolUseFailure", {}), "error")
+        self.assertEqual(
+            notice_kind_from_hook("notification", {"title": "Build failed", "type": "error"}),
+            "error",
+        )
 
 
 class AgentHubPacketTests(unittest.TestCase):
@@ -186,7 +216,7 @@ class AgentHubPacketTests(unittest.TestCase):
     def test_auto_rotate_prefers_busy_and_respects_manual_grace(self) -> None:
         hub = AgentHub(rotate_idle_sec=5, rotate_busy_sec=20, manual_grace_sec=30, presence_window=600)
         now = 1_700_000_300.0
-        hub.ingest_hook({"client_kind": "codex", "source": "codex", "hook_event_name": "Stop"}, now=now)
+        hub.ingest_hook({"client_kind": "codex", "source": "codex", "hook_event_name": "SessionStart"}, now=now)
         hub.ingest_hook({"client_kind": "pi", "hook_event_name": "UserPromptSubmit"}, now=now)
         hub.current_id = "codex"
         hub._rotate_started_at = now

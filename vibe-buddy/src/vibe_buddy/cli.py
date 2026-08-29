@@ -72,6 +72,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Show what would be configured without writing",
     )
 
+    p_auto = sub.add_parser(
+        "setup-autostart",
+        help="Install macOS LaunchAgent so the bridge starts at login",
+    )
+    p_auto.add_argument("--uninstall", action="store_true", help="Remove LaunchAgent")
+    p_auto.add_argument("--status", action="store_true", help="Show LaunchAgent status")
+    p_auto.add_argument(
+        "--vibe-buddy",
+        default=None,
+        help="Absolute path to vibe-buddy binary (default: PATH)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "start":
@@ -128,6 +140,14 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             scan_only=bool(args.scan),
         )
+    if args.cmd == "setup-autostart":
+        from vibe_buddy.autostart import install_autostart, status_autostart, uninstall_autostart
+
+        if args.status:
+            return status_autostart()
+        if args.uninstall:
+            return uninstall_autostart()
+        return install_autostart(vibe_buddy=args.vibe_buddy)
 
     parser.error(f"unknown command: {args.cmd}")
     return 2
