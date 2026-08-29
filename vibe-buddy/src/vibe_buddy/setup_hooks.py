@@ -238,10 +238,28 @@ def install_opencodex(_vibe_buddy: str) -> None:
 
 
 def install_dsh(_vibe_buddy: str) -> None:
-    print(
-        "dsh: detected, but no stable host hook surface yet — "
-        "Hub accepts `vibe-buddy post --client-kind dsh` when wired"
-    )
+    """DSH is already first-class via process presence (no host hook file)."""
+    from vibe_buddy.paths import DEFAULT_CONFIG, ensure_state_dir
+
+    ensure_state_dir()
+    cfg: dict[str, Any] = dict(DEFAULT_CONFIG)
+    if BRIDGE_CONFIG.exists():
+        try:
+            loaded = json.loads(BRIDGE_CONFIG.read_text())
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except json.JSONDecodeError:
+            pass
+    # Process presence is on unless explicitly disabled.
+    if cfg.get("no_process_presence"):
+        cfg["no_process_presence"] = False
+        BRIDGE_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+        print("dsh: re-enabled process presence in bridge config")
+    else:
+        print("dsh: already wired via process presence (ps scan for `dsh` / `dsh web`)")
+    print("  Hub id=dsh, title=DSH; pet pack=Kimi; exit → drop from carousel")
+    print("  optional: `vibe-buddy post --client-kind dsh` for hook-shaped events")
+
 
 
 def install_note(name: str, message: str) -> Callable[[str], None]:
@@ -305,10 +323,10 @@ AGENTS: tuple[AgentSpec, ...] = (
     AgentSpec(
         id="dsh",
         title="DeepSeek Harness",
-        kind="note",
-        detect=lambda: bool(_which("dsh")),
+        kind="service",
+        detect=lambda: bool(_which("dsh") or _dir(HOME / ".dsh")),
         install=install_dsh,
-        notes="no stable hook API yet",
+        notes="process presence (no host hooks); Hub + Kimi pack already first-class",
     ),
     AgentSpec(
         id="opencodex",

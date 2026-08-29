@@ -44,8 +44,8 @@ vibe-buddy setup-hooks --agent cursor
 vibe-buddy setup-hooks --agent all
 ```
 
-Catalog (detection cues): Cursor, Codex, Claude Code, Pi, Hermes, DSH,
-OpenCodex (quota service), Aider / Kimi / Zed (detect-only notes).
+Catalog (detection cues): Cursor, Codex, Claude Code, Pi, Hermes, DSH
+(process presence), OpenCodex (quota service), Aider / Kimi / Zed (detect-only notes).
 
 `setup-hooks` writes absolute paths from `which vibe-buddy`, not repo scripts.
 
