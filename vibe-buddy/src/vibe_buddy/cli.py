@@ -47,19 +47,29 @@ def main(argv: list[str] | None = None) -> int:
 
     p_setup = sub.add_parser(
         "setup-hooks",
-        help="Wire Cursor/Pi/Hermes/Codex hooks to this installed vibe-buddy",
+        help="Scan installed agents and wire hooks to this vibe-buddy (or --agent …)",
     )
     p_setup.add_argument(
         "--agent",
         action="append",
         dest="agents",
         metavar="NAME",
-        help="Agent(s): cursor,pi,hermes,codex,dsh,all (repeatable / comma-separated)",
+        help="Agent(s): cursor,codex,claude,pi,hermes,dsh,opencodex,… / all / auto (default: auto-detect)",
     )
     p_setup.add_argument(
         "--vibe-buddy",
         default=None,
         help="Absolute path to vibe-buddy binary (default: PATH)",
+    )
+    p_setup.add_argument(
+        "--scan",
+        action="store_true",
+        help="Print installed-tool detection JSON only",
+    )
+    p_setup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be configured without writing",
     )
 
     args = parser.parse_args(argv)
@@ -112,7 +122,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "setup-hooks":
         from vibe_buddy.setup_hooks import setup_hooks
 
-        return setup_hooks(args.agents, vibe_buddy=args.vibe_buddy)
+        return setup_hooks(
+            args.agents,
+            vibe_buddy=args.vibe_buddy,
+            dry_run=bool(args.dry_run),
+            scan_only=bool(args.scan),
+        )
 
     parser.error(f"unknown command: {args.cmd}")
     return 2

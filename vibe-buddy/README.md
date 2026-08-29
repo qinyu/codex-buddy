@@ -33,16 +33,21 @@ State/config: `~/.codex/codex-usage-bridge/` (unchanged).
 
 ## Wire host hooks
 
-After install, point Cursor / Pi / Hermes / Codex at the **installed** binary:
+With **no** `--agent`, vibe-buddy scans this machine for known tools and only
+configures the ones it finds:
 
 ```bash
-vibe-buddy setup-hooks
+vibe-buddy setup-hooks                 # auto-detect + configure
+vibe-buddy setup-hooks --scan          # JSON inventory only
+vibe-buddy setup-hooks --dry-run       # show plan, write nothing
 vibe-buddy setup-hooks --agent cursor
-vibe-buddy setup-hooks --agent cursor,pi --agent hermes
 vibe-buddy setup-hooks --agent all
 ```
 
-`setup-hooks` writes absolute paths (`which vibe-buddy`), not repo-relative scripts.
+Catalog (detection cues): Cursor, Codex, Claude Code, Pi, Hermes, DSH,
+OpenCodex (quota service), Aider / Kimi / Zed (detect-only notes).
+
+`setup-hooks` writes absolute paths from `which vibe-buddy`, not repo scripts.
 
 ## OpenCodex (quota meters)
 
