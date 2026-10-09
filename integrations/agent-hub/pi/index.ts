@@ -1,11 +1,11 @@
-// Codex Buddy Stick — Agent Hub presence (no Ping Island dependency).
-// NOTIFY path placeholder filled by install_presence.py.
+// Vibe Buddy Stick — Agent Hub presence (extension id: vibe_buddy_hub).
+// __VIBE_BUDDY__ filled by setup-hooks with the installed CLI path.
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const NOTIFY = [
-  "python3",
-  "__CODEX_BUDDY_NOTIFY__",
+  "__VIBE_BUDDY__",
+  "post",
   "--client-kind",
   "pi",
   "--client-name",

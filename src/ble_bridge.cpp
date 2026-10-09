@@ -29,6 +29,30 @@ static volatile bool      connected = false;
 static volatile bool      secure = false;
 static volatile uint32_t  passkey = 0;
 static volatile uint16_t  mtu = 23;
+static bool               advertisingEnabled = true;
+static bool               powerSave = false;
+
+// Advertising interval in 0.625ms units. Active: ~20–40ms. Save: ~1–2s.
+static void applyAdvertisingIntervals() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (!adv) return;
+  if (powerSave) {
+    adv->setMinInterval(0x0640);  // 1000ms
+    adv->setMaxInterval(0x0C80);  // 2000ms
+  } else {
+    adv->setMinInterval(0x20);    // 20ms
+    adv->setMaxInterval(0x40);    // 40ms
+  }
+}
+
+static void restartAdvertisingIfAllowed() {
+  if (!advertisingEnabled || connected) return;
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (!adv) return;
+  applyAdvertisingIntervals();
+  adv->stop();
+  BLEDevice::startAdvertising();
+}
 
 static void rxPush(const uint8_t* p, size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -57,8 +81,8 @@ class ServerCallbacks : public BLEServerCallbacks {
     passkey = 0;
     mtu = 23;
     Serial.println("[ble] disconnected");
-    // Restart advertising so the next client can find us.
-    BLEDevice::startAdvertising();
+    // Restart advertising so the next client can find us (unless disabled).
+    restartAdvertisingIfAllowed();
   }
   void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
     mtu = param->mtu.mtu;
@@ -129,13 +153,39 @@ void bleInit(const char* deviceName) {
   adv->setScanResponse(true);
   adv->setMinPreferred(0x06);   // iOS-friendly connection interval
   adv->setMaxPreferred(0x12);
-  BLEDevice::startAdvertising();
-  Serial.printf("[ble] advertising as '%s'\n", deviceName);
+  applyAdvertisingIntervals();
+  if (advertisingEnabled) {
+    BLEDevice::startAdvertising();
+    Serial.printf("[ble] advertising as '%s'\n", deviceName);
+  } else {
+    Serial.printf("[ble] ready as '%s' (advertising off)\n", deviceName);
+  }
 }
 
 bool bleConnected() { return connected; }
 bool bleSecure()    { return secure; }
 uint32_t blePasskey() { return passkey; }
+
+void bleSetPowerSave(bool enable) {
+  if (powerSave == enable) return;
+  powerSave = enable;
+  Serial.printf("[ble] power-save %s\n", enable ? "on" : "off");
+  restartAdvertisingIfAllowed();
+}
+
+void bleSetAdvertisingEnabled(bool enable) {
+  advertisingEnabled = enable;
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (!adv) return;
+  if (enable) {
+    applyAdvertisingIntervals();
+    if (!connected) BLEDevice::startAdvertising();
+    Serial.println("[ble] advertising enabled");
+  } else {
+    adv->stop();
+    Serial.println("[ble] advertising stopped");
+  }
+}
 
 void bleClearBonds() {
   int n = esp_ble_get_bond_device_num();

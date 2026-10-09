@@ -55,6 +55,8 @@ PersonaState activeState = P_SLEEP;
 PersonaState oneShotState = P_IDLE;
 uint32_t     oneShotUntil = 0;
 uint32_t     lastShakeCheck = 0;
+uint32_t     lastShakeActionMs = 0;  // debounce so one shake ≠ many agent nexts
+const uint16_t SHAKE_ACTION_COOLDOWN_MS = 900;
 float        accelBaseline = 1.0f;
 unsigned long t = 0;
 
@@ -113,6 +115,7 @@ static void nextPet() {
 }
 uint32_t wakeTransitionUntil = 0;
 const uint32_t SCREEN_OFF_MS = 30000;
+const uint32_t PROMPT_TIMEOUT_MS = 45000;  // approval / done / error panel
 
 bool     napping = false;
 uint32_t napStartMs = 0;
@@ -136,9 +139,39 @@ static void wake() {
     applyBrightness();
     screenOff = false;
     wakeTransitionUntil = millis() + 12000;
+    bleSetPowerSave(false);
   }
   if (dimmed) { applyBrightness(); dimmed = false; }
 }
+
+// Notice panels (done/error) only need confirm; approval keeps accept/cancel.
+static bool promptIsNotice() {
+  return tama.promptKind[0]
+      && (strcmp(tama.promptKind, "done") == 0
+          || strcmp(tama.promptKind, "error") == 0
+          || strcmp(tama.promptKind, "complete") == 0);
+}
+
+static void alertForPrompt() {
+  if (!settings().sound) return;
+  if (strcmp(tama.promptKind, "error") == 0) {
+    M5.Speaker.tone(700, 110);
+    delay(120);
+    M5.Speaker.tone(420, 160);
+  } else if (promptIsNotice()) {
+    M5.Speaker.tone(1100, 55);
+    delay(65);
+    M5.Speaker.tone(1500, 55);
+    delay(65);
+    M5.Speaker.tone(1900, 90);
+  } else {
+    // Approval: double chirp so it cuts through even after screen-off.
+    M5.Speaker.tone(1450, 90);
+    delay(110);
+    M5.Speaker.tone(1450, 90);
+  }
+}
+
 bool     responseSent = false;
 
 static void beep(uint16_t freq, uint16_t dur) {
@@ -150,6 +183,15 @@ static void sendCmd(const char* json) {
   size_t n = strlen(json);
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
+}
+
+static void sendPromptDecision(const char* decision) {
+  char cmd[96];
+  snprintf(cmd, sizeof(cmd),
+           "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"%s\"}",
+           tama.promptId, decision);
+  sendCmd(cmd);
+  responseSent = true;
 }
 const uint8_t INFO_PAGES = 6;
 const uint8_t INFO_PG_BUTTONS = 1;
@@ -913,46 +955,72 @@ static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t
 
 static void drawApproval() {
   const Palette& p = characterPalette();
-  const int AREA = 78;
-  spr.fillRect(0, H - AREA, W, AREA, p.bg);
-  spr.drawFastHLine(0, H - AREA, W, p.textDim);
+  // Cover the entire usage/provider block so the screen stays two panes:
+  // pet chrome above, approval/notice below (same band as meters).
+  const int top = USAGE_PET_BOTTOM;
+  const int AREA = H - top;
+  spr.fillRect(0, top, W, AREA, p.bg);
+  spr.drawFastHLine(0, top, W, p.textDim);
+
+  const bool notice = promptIsNotice();
+  const bool isError = strcmp(tama.promptKind, "error") == 0;
 
   spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(4, H - AREA + 4);
+  spr.setCursor(4, top + 4);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
-  spr.printf("approve? %lus", (unsigned long)waited);
+  if (isError)       spr.printf("error? %lus", (unsigned long)waited);
+  else if (notice)   spr.printf("done? %lus", (unsigned long)waited);
+  else               spr.printf("approve? %lus", (unsigned long)waited);
 
   // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
   int toolLen = strlen(tama.promptTool);
-  spr.setTextColor(p.text, p.bg);
+  spr.setTextColor(isError ? HOT : p.text, p.bg);
   spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
+  spr.setCursor(4, top + (toolLen <= 10 ? 18 : 22));
   spr.print(tama.promptTool);
   spr.setTextSize(1);
 
-  // Hint wraps at ~21 chars to two lines under the tool name
+  // Hint wraps at ~21 chars; taller panel allows a third line.
   spr.setTextColor(p.textDim, p.bg);
   int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
+  int hintY = top + 42;
+  spr.setCursor(4, hintY);
   spr.printf("%.21s", tama.promptHint);
   if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
+    spr.setCursor(4, hintY + 10);
     spr.printf("%.21s", tama.promptHint + 21);
   }
+  if (hlen > 42) {
+    spr.setCursor(4, hintY + 20);
+    spr.printf("%.21s", tama.promptHint + 42);
+  }
 
+  // Physical layout: BtnA below screen, BtnB on the right edge → ↓ / →.
+  const int hy = H - 14;
   if (responseSent) {
     spr.setTextColor(p.textDim, p.bg);
-    spr.setCursor(4, H - 12);
+    spr.setCursor(4, hy);
     spr.print("sent...");
+  } else if (notice) {
+    // Confirm-only: A (↓). B also confirms for one-handed dismiss.
+    spr.setTextColor(isError ? HOT : GREEN, p.bg);
+    spr.setCursor(4, hy);
+    spr.print("ok");
+    uint16_t col = isError ? HOT : GREEN;
+    spr.fillTriangle(4 + 2 * 6 + 4, hy + 1, 4 + 2 * 6 + 10, hy + 1, 4 + 2 * 6 + 7, hy + 6, col);
   } else {
     spr.setTextColor(GREEN, p.bg);
-    spr.setCursor(4, H - 12);
-    spr.print("A: accept");
+    spr.setCursor(4, hy);
+    spr.print("accept");
+    spr.fillTriangle(4 + 6 * 6 + 4, hy + 1, 4 + 6 * 6 + 10, hy + 1, 4 + 6 * 6 + 7, hy + 6, GREEN);
+
     spr.setTextColor(HOT, p.bg);
-    spr.setCursor(W - 54, H - 12);
-    spr.print("B: cancel");
+    int rx = W - 8 - 6 * 6 - 10;
+    spr.setCursor(rx, hy);
+    spr.print("cancel");
+    spr.fillTriangle(W - 10, hy, W - 10, hy + 6, W - 5, hy + 3, HOT);
   }
 }
 
@@ -1155,26 +1223,33 @@ static const char* usageTopTitle() {
   return tama.codexAgent[0] ? tama.codexAgent : "CODEX";
 }
 
+static bool agentIdIs(const char* agentId, const char* name) {
+  return agentId && name && strcasecmp(agentId, name) == 0;
+}
+
 static const char* packNameForAgentId(const char* agentId) {
   // Ping Island MascotView exports (idle/working/warning/dragging).
   if (!agentId || !*agentId) return "Mao";
-  if (strcmp(agentId, "codex") == 0) return "Codex";
-  if (strcmp(agentId, "pi") == 0) return "Pi";
-  if (strcmp(agentId, "hermes") == 0) return "Hermes";
-  if (strcmp(agentId, "cursor") == 0) return "Cursor";
+  if (agentIdIs(agentId, "codex")) return "Codex";
+  if (agentIdIs(agentId, "pi")) return "Pi";
+  if (agentIdIs(agentId, "hermes")) return "Hermes";
+  if (agentIdIs(agentId, "cursor")) return "Cursor";
   // Island has no DSH mascot — reuse Kimi keyboard-orb.
-  if (strcmp(agentId, "dsh") == 0 || strcmp(agentId, "kimi") == 0) return "Kimi";
+  if (agentIdIs(agentId, "dsh") || agentIdIs(agentId, "kimi")) return "Kimi";
   // claude / gemini / unknown: Mao until a Stick pack is shipped.
   return "Mao";
 }
 
-static void ensureAgentCharacterPack() {
+static bool ensureAgentCharacterPack() {
   static char lastAgentId[16] = "";
   const char* aid = tama.codexAgentId[0] ? tama.codexAgentId : "codex";
-  if (strcmp(lastAgentId, aid) == 0) return;
+  if (strcasecmp(lastAgentId, aid) == 0) return false;
   strncpy(lastAgentId, aid, sizeof(lastAgentId) - 1);
   lastAgentId[sizeof(lastAgentId) - 1] = 0;
   characterSelect(packNameForAgentId(aid), "Mao");
+  usageFullPushNeeded = true;
+  Serial.printf("[char] agent %s -> pack %s\n", aid, characterCurrentName());
+  return true;
 }
 
 // Long provider titles collapse to the first whitespace-delimited word.
@@ -1579,15 +1654,22 @@ static void drawUsageDashboardLandscape() {
       canvasChanged = true;
     }
 
+    static char cachedPack[24] = "";
+    bool packChanged = strncmp(cachedPack, characterCurrentName(), sizeof(cachedPack)) != 0;
+    if (packChanged) {
+      strncpy(cachedPack, characterCurrentName(), sizeof(cachedPack) - 1);
+      cachedPack[sizeof(cachedPack) - 1] = 0;
+    }
+
     bool stateChanged = cachedPetState != activeState;
-    if (canvasChanged || stateChanged) usagePetSpr.fillSprite(p.bg);
+    if (canvasChanged || stateChanged || packChanged) usagePetSpr.fillSprite(p.bg);
 
     characterSetState(activeState);
     bool frameDrawn = false;
     if (cachedPetW == leftW && cachedPetH == lh) {
       frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
                                      58, 0, 0, leftW, lh);
-      if (orientChanged || canvasChanged || stateChanged || frameDrawn) {
+      if (orientChanged || canvasChanged || stateChanged || packChanged || frameDrawn) {
         usagePetSpr.pushSprite(0, 0);
       }
     } else {
@@ -1750,39 +1832,60 @@ void loop() {
     }
   }
 
-  // shake → dizzy + force scenario advance
-  if (now - lastShakeCheck > 50) {
-    lastShakeCheck = now;
-    if (!menuOpen && !settingsOpen && !resetOpen && !screenOff
-        && checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
-      wake();
-      triggerOneShot(P_DIZZY, 2000);
-      Serial.println("shake: dizzy");
-    }
-  }
-
-  // BtnA: step through fake scenarios
-  // Prompt arrival: beep, reset response flag
+  // Prompt / notice arrival: wake from screen-off or face-down nap, then alert.
   if (strcmp(tama.promptId, lastPromptId) != 0) {
     strncpy(lastPromptId, tama.promptId, sizeof(lastPromptId)-1);
     lastPromptId[sizeof(lastPromptId)-1] = 0;
     responseSent = false;
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
+      if (napping) {
+        napping = false;
+        // leave faceDownFrames alone; sustained face-down will re-nap after dismiss
+      }
       wake();
-      beep(1200, 80);   // alert chirp
-      // Jump to the approval screen no matter what was open — drawApproval
-      // only runs from drawHUD which only runs in DISP_NORMAL.
+      alertForPrompt();
+      // Switch pet to the notifying agent before first paint.
+      ensureAgentCharacterPack();
+      // Jump to the approval/notice screen no matter what was open.
       displayMode = DISP_NORMAL;
       menuOpen = settingsOpen = resetOpen = false;
       btnAPendingClick = false;
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
+      usageFullPushNeeded = true;
     }
   }
 
   bool inPrompt = tama.promptId[0] && !responseSent;
+
+  // 45s timeout: notices ack, approvals cancel (PC hook also waits ~45s).
+  if (inPrompt && (millis() - promptArrivedMs) >= PROMPT_TIMEOUT_MS) {
+    sendPromptDecision(promptIsNotice() ? "ack" : "cancel");
+  }
+
+  // shake → next agent when the hub has multiple; otherwise dizzy one-shot.
+  if (now - lastShakeCheck > 50) {
+    lastShakeCheck = now;
+    bool canShake = !menuOpen && !settingsOpen && !resetOpen && !screenOff
+        && !inPrompt
+        && checkShake()
+        && (int32_t)(now - lastShakeActionMs) >= (int32_t)SHAKE_ACTION_COOLDOWN_MS
+        && (int32_t)(now - oneShotUntil) >= 0;
+    if (canShake) {
+      wake();
+      lastShakeActionMs = now;
+      if (displayMode == DISP_NORMAL && tama.codexAgentCount > 1) {
+        sendCmd("{\"cmd\":\"agent\",\"action\":\"next\"}");
+        beep(900, 40);
+        Serial.println("shake: agent next");
+      } else {
+        triggerOneShot(P_DIZZY, 2000);
+        Serial.println("shake: dizzy");
+      }
+    }
+  }
 
   // Button-press wake. Track which button woke the screen so its full
   // press cycle (including long-press) is swallowed — you don't want
@@ -1800,9 +1903,10 @@ void loop() {
   if (M5.BtnPWR.wasClicked()) {
     if (screenOff) {
       wake();
-    } else {
+    } else if (!inPrompt) {
       M5.Lcd.sleep();
       screenOff = true;
+      bleSetPowerSave(true);
     }
   }
 
@@ -1823,14 +1927,16 @@ void loop() {
     if (btnAStablePress && !btnALong && !swallowBtnA) {
       if (inPrompt) {
         btnAPendingClick = false;
-        char cmd[96];
-        snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"accept\"}", tama.promptId);
-        sendCmd(cmd);
-        responseSent = true;
-        uint32_t tookS = (millis() - promptArrivedMs) / 1000;
-        statsOnApproval(tookS);
-        beep(2400, 60);
-        if (tookS < 5) triggerOneShot(P_HEART, 2000);
+        if (promptIsNotice()) {
+          sendPromptDecision("ack");
+          beep(2400, 60);
+        } else {
+          sendPromptDecision("accept");
+          uint32_t tookS = (millis() - promptArrivedMs) / 1000;
+          statsOnApproval(tookS);
+          beep(2400, 60);
+          if (tookS < 5) triggerOneShot(P_HEART, 2000);
+        }
       } else if (resetOpen) {
         btnAPendingClick = false;
         beep(1800, 30);
@@ -1897,12 +2003,14 @@ void loop() {
       if (swallowBtnB) { swallowBtnB = false; }
       else
       if (inPrompt) {
-        char cmd[96];
-        snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"cancel\"}", tama.promptId);
-        sendCmd(cmd);
-        responseSent = true;
-        statsOnDenial();
-        beep(600, 60);
+        if (promptIsNotice()) {
+          sendPromptDecision("ack");
+          beep(1800, 40);
+        } else {
+          sendPromptDecision("cancel");
+          statsOnDenial();
+          beep(600, 60);
+        }
       } else if (resetOpen) {
         beep(2400, 30);
         applyReset(resetSel);
@@ -2096,6 +2204,7 @@ void loop() {
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
     M5.Lcd.sleep();
     screenOff = true;
+    bleSetPowerSave(true);
   }
 
   delay(screenOff ? 100 : 16);

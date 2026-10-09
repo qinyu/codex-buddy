@@ -27,6 +27,11 @@ uint32_t blePasskey();
 // Erase all stored bonds (LTKs) from NVS. Called from the "unpair" cmd
 // and from factory reset.
 void bleClearBonds();
+// Prefer slower advertising while the Stick is idle (screen off / battery).
+// Connection stays up; only advertising intervals change when disconnected.
+void bleSetPowerSave(bool enable);
+// Settings → bluetooth: stop advertising when off (link kept if already up).
+void bleSetAdvertisingEnabled(bool enable);
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);

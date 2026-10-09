@@ -1,7 +1,7 @@
-# Codex Buddy Stick — Hermes Agent Hub presence (no Ping Island)
-name: codex_buddy_hub
+# Vibe Buddy Stick — Hermes Agent Hub presence (no Ping Island)
+name: vibe_buddy_hub
 version: 1.0.0
-description: Forward Hermes hooks to Codex Buddy Stick Agent Hub
+description: Forward Hermes hooks to Vibe Buddy Stick Agent Hub
 provides_hooks:
   - on_session_start
   - pre_llm_call

@@ -6,8 +6,8 @@ Fails open (exit 0) when the bridge is offline so host agents stay green.
 
 Usage (stdin = hook JSON):
 
-  python3 tools/agent_hub_notify.py --client-kind cursor --client-name Cursor
-  python3 tools/agent_hub_notify.py --client-kind pi --event UserPromptSubmit
+  vibe-buddy post --client-kind cursor --client-name Cursor
+  vibe-buddy post --client-kind pi --event UserPromptSubmit
 """
 
 from __future__ import annotations
@@ -20,8 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_HUB_SOCK = Path.home() / ".codex" / "codex-usage-bridge" / "agent-hub.sock"
+from vibe_buddy.paths import AGENT_HUB_SOCK_PATH
 
 
 def read_stdin() -> dict[str, Any]:
@@ -49,7 +48,7 @@ def send_hub(sock_path: Path, envelope: dict[str, Any]) -> None:
             reader.readline(4096)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-kind", required=True, help="Agent id: cursor|pi|hermes|dsh|codex")
     parser.add_argument("--client-name", default="", help="Display title override")
@@ -58,9 +57,9 @@ def main() -> int:
     parser.add_argument(
         "--agent-hub-sock",
         type=Path,
-        default=Path(os.environ.get("CODEX_AGENT_HUB_SOCK", DEFAULT_HUB_SOCK)),
+        default=Path(os.environ.get("CODEX_AGENT_HUB_SOCK", AGENT_HUB_SOCK_PATH)),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     kind = str(args.client_kind).strip().lower()
     hook = read_stdin()
