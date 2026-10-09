@@ -38,30 +38,6 @@ static uint32_t _xWipeDir(const char* dir) {
   return freed;
 }
 
-// Only one character lives on the device at a time. Installing a new one
-// under a different name would otherwise leave the old one's files eating
-// space. Wipe everything under /characters/, return total bytes reclaimed.
-static uint32_t _xWipeAllChars() {
-  File root = LittleFS.open("/characters");
-  if (!root || !root.isDirectory()) { LittleFS.mkdir("/characters"); return 0; }
-  uint32_t freed = 0;
-  File sub = root.openNextFile();
-  while (sub) {
-    if (sub.isDirectory()) {
-      char p[64];
-      snprintf(p, sizeof(p), "/characters/%s", sub.name());
-      sub.close();
-      freed += _xWipeDir(p);
-      LittleFS.rmdir(p);
-    } else {
-      sub.close();
-    }
-    sub = root.openNextFile();
-  }
-  root.close();
-  return freed;
-}
-
 // Called from data.h when incoming JSON has a "cmd" key. Returns true if
 // it was a transfer command (caller should skip state-update parsing).
 // Needs characterClose()/characterInit() declared before this include.
@@ -142,23 +118,18 @@ inline bool xferCommand(JsonDocument& doc) {
     const char* name = doc["name"] | "pet";
     _xTotal = doc["total"] | 0;
 
-    // Fit check: free space after wiping everything under /characters/.
-    // Do the math before touching the filesystem so a failed check leaves
-    // the current character intact.
+    // Fit check: free space plus the pack being replaced. Other agent packs
+    // stay on the device so shake-to-switch can still find them.
     uint32_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
     uint32_t reclaimable = 0;
     {
-      File r = LittleFS.open("/characters");
-      if (r && r.isDirectory()) {
-        File s = r.openNextFile();
-        while (s) {
-          if (s.isDirectory()) {
-            File f = s.openNextFile();
-            while (f) { reclaimable += f.size(); f.close(); f = s.openNextFile(); }
-          }
-          s.close(); s = r.openNextFile();
-        }
-        r.close();
+      char existing[48];
+      snprintf(existing, sizeof(existing), "/characters/%s", name);
+      File d = LittleFS.open(existing);
+      if (d && d.isDirectory()) {
+        File f = d.openNextFile();
+        while (f) { reclaimable += f.size(); f.close(); f = d.openNextFile(); }
+        d.close();
       }
     }
     // Headroom for LittleFS metadata overhead — it's not byte-for-byte.
@@ -176,8 +147,9 @@ inline bool xferCommand(JsonDocument& doc) {
 
     strncpy(_xCharName, name, sizeof(_xCharName)-1); _xCharName[sizeof(_xCharName)-1]=0;
     characterClose();
-    _xWipeAllChars();
     char dir[48]; snprintf(dir, sizeof(dir), "/characters/%s", _xCharName);
+    _xWipeDir(dir);
+    LittleFS.rmdir(dir);
     LittleFS.mkdir(dir);
     _xTotalWritten = 0;
     _xActive = true;

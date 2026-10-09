@@ -34,6 +34,7 @@ static bool    loaded = false;
 static Palette pal = { 0xC2A6, 0x0000, 0xFFFF, 0x8410, 0x0000 };
 static char    basePath[48];
 static char    currentPackName[24] = "";
+static char    openedPack[24] = "";
 static const uint8_t MAX_GIFS = 32;
 static char    gifPaths[MAX_GIFS][32];
 static uint8_t stateStart[N_STATES];
@@ -240,6 +241,10 @@ bool characterInit(const char* name) {
       }
     }
     loaded = true;
+    curState = 0xFF;
+    animPauseUntil = 0;
+    keepFrameOnNextOpen = false;
+    openedPack[0] = 0;
     strncpy(currentPackName, name, sizeof(currentPackName) - 1);
     currentPackName[sizeof(currentPackName) - 1] = 0;
     Serial.printf("[char] loaded '%s' (text mode, %d states)\n", name, N_STATES);
@@ -266,6 +271,10 @@ bool characterInit(const char* name) {
 
   gif.begin(LITTLE_ENDIAN_PIXELS);
   loaded = true;
+  curState = 0xFF;
+  animPauseUntil = 0;
+  keepFrameOnNextOpen = false;
+  openedPack[0] = 0;
   {
     const char* shown = doc["name"] | name;
     strncpy(currentPackName, name, sizeof(currentPackName) - 1);
@@ -449,6 +458,9 @@ void characterClose() {
   loaded = false;
   textMode = false;
   curState = 0xFF;
+  animPauseUntil = 0;
+  keepFrameOnNextOpen = false;
+  openedPack[0] = 0;
 }
 
 void characterInvalidate() {
@@ -466,7 +478,9 @@ void characterInvalidate() {
 }
 
 void characterSetState(uint8_t s) {
-  if (!loaded || s >= N_STATES || s == curState) return;
+  // Same pet state (idle/busy/…) must still reopen after an agent pack switch.
+  bool packChanged = strcmp(openedPack, currentPackName) != 0;
+  if (!loaded || s >= N_STATES || (s == curState && !packChanged)) return;
 
   if (textMode) {
     curState = s;
@@ -500,10 +514,14 @@ void characterSetState(uint8_t s) {
     keepFrameOnNextOpen = false;
     nextFrameAt = 0;
     variantStartedMs = millis();
+    strncpy(openedPack, currentPackName, sizeof(openedPack) - 1);
+    openedPack[sizeof(openedPack) - 1] = 0;
     Serial.printf("[char] %s: %dx%d @ (%d,%d) heap=%u\n",
       gifPaths[idx], gifW, gifH, gifX, gifY, ESP.getFreeHeap());
   } else {
     keepFrameOnNextOpen = false;
+    strncpy(openedPack, currentPackName, sizeof(openedPack) - 1);
+    openedPack[sizeof(openedPack) - 1] = 0;
     Serial.printf("[char] open failed: %s (err %d)\n", full, gif.getLastError());
   }
 }

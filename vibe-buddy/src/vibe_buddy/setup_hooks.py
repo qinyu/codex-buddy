@@ -24,8 +24,12 @@ HOME = Path.home()
 APPLICATIONS = Path("/Applications")
 CURSOR_HOOKS = HOME / ".cursor" / "hooks.json"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
-PI_EXT = HOME / ".pi" / "agent" / "extensions" / "codex_buddy_hub"
-HERMES_PLUGIN = HOME / ".hermes" / "plugins" / "codex_buddy_hub"
+# Install dir name: vibe_buddy_hub (legacy codex_buddy_hub is removed on reinstall).
+PI_EXT = HOME / ".pi" / "agent" / "extensions" / "vibe_buddy_hub"
+PI_EXT_LEGACY = HOME / ".pi" / "agent" / "extensions" / "codex_buddy_hub"
+HERMES_PLUGIN = HOME / ".hermes" / "plugins" / "vibe_buddy_hub"
+HERMES_PLUGIN_LEGACY = HOME / ".hermes" / "plugins" / "codex_buddy_hub"
+HERMES_CONFIG = HOME / ".hermes" / "config.yaml"
 CODEX_PLUGIN_HOOKS = REPO_ROOT / "plugins" / "codex-usage-stick" / "hooks.json"
 BRIDGE_CONFIG = HOME / ".codex" / "codex-usage-bridge" / "config.json"
 OPENCODEX_TOKEN = HOME / ".opencodex" / "admin-api-token"
@@ -55,6 +59,7 @@ LEGACY_MARKERS = (
     "vibe-buddy post",
     "vibe_buddy",
     "vibe-buddy hook",
+    "codex_buddy_hub",
 )
 
 
@@ -179,13 +184,43 @@ def install_claude(vibe_buddy: str) -> None:
     print(f"  → {cmd}")
 
 
+def _remove_legacy_dir(path: Path, label: str) -> None:
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path)
+        print(f"{label}: removed legacy {path}")
+    except OSError as exc:
+        print(f"{label}: could not remove legacy {path}: {exc}", file=sys.stderr)
+
+
 def install_pi(vibe_buddy: str) -> None:
     src = INTEGRATIONS / "pi" / "index.ts"
     if not src.exists():
         print(f"pi: template missing ({src})", file=sys.stderr)
         return
+    _remove_legacy_dir(PI_EXT_LEGACY, "pi")
     render_template(src, PI_EXT / "index.ts", vibe_buddy)
     print(f"pi: {PI_EXT}")
+
+
+def _ensure_hermes_plugin_enabled() -> None:
+    """Remind / lightly hint; do not rewrite whole Hermes config.yaml (comments/order)."""
+    if not HERMES_CONFIG.is_file():
+        print(
+            "hermes: no config.yaml — enable plugin manually: plugins.enabled += vibe_buddy_hub",
+            file=sys.stderr,
+        )
+        return
+    text = HERMES_CONFIG.read_text()
+    if "vibe_buddy_hub" in text:
+        print(f"hermes: confirm `vibe_buddy_hub` is under plugins.enabled in {HERMES_CONFIG}")
+        return
+    print(
+        "hermes: add this under plugins.enabled (and remove any `codex_buddy_hub`):\n"
+        "    - vibe_buddy_hub",
+        file=sys.stderr,
+    )
 
 
 def install_hermes(vibe_buddy: str) -> None:
@@ -193,10 +228,12 @@ def install_hermes(vibe_buddy: str) -> None:
     if not (src / "__init__.py").exists():
         print(f"hermes: template missing ({src})", file=sys.stderr)
         return
+    _remove_legacy_dir(HERMES_PLUGIN_LEGACY, "hermes")
     HERMES_PLUGIN.mkdir(parents=True, exist_ok=True)
     render_template(src / "__init__.py", HERMES_PLUGIN / "__init__.py", vibe_buddy)
     shutil.copy2(src / "plugin.yaml", HERMES_PLUGIN / "plugin.yaml")
     print(f"hermes: {HERMES_PLUGIN}")
+    _ensure_hermes_plugin_enabled()
 
 
 def install_codex(vibe_buddy: str) -> None:
@@ -310,7 +347,7 @@ AGENTS: tuple[AgentSpec, ...] = (
         kind="hooks",
         detect=lambda: bool(_which("pi") or _dir(HOME / ".pi")),
         install=install_pi,
-        notes="~/.pi/agent/extensions/codex_buddy_hub",
+        notes="~/.pi/agent/extensions/vibe_buddy_hub",
     ),
     AgentSpec(
         id="hermes",
@@ -318,7 +355,7 @@ AGENTS: tuple[AgentSpec, ...] = (
         kind="hooks",
         detect=lambda: bool(_which("hermes") or _dir(HOME / ".hermes")),
         install=install_hermes,
-        notes="~/.hermes/plugins/codex_buddy_hub",
+        notes="~/.hermes/plugins/vibe_buddy_hub",
     ),
     AgentSpec(
         id="dsh",

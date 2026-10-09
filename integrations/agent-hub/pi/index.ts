@@ -1,5 +1,5 @@
-// Vibe Buddy Stick — Agent Hub presence (no Ping Island dependency).
-// __VIBE_BUDDY__ filled by install_presence.py with the installed CLI path.
+// Vibe Buddy Stick — Agent Hub presence (extension id: vibe_buddy_hub).
+// __VIBE_BUDDY__ filled by setup-hooks with the installed CLI path.
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 

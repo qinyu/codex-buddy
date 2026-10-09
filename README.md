@@ -1,7 +1,7 @@
-# Codex Buddy
+# Vibe Buddy
 
-Codex Buddy turns an M5Stack StickS3 into a desktop companion for Codex usage, live states, and animated GIF pets.
-It pairs firmware with a local Codex bridge so the device can show usage bars, reset countdowns, and live work-state animations over BLE.
+Vibe Buddy turns an M5Stack StickS3 into a desktop companion for agent usage, live states, and animated GIF pets.
+It pairs firmware with a local PC bridge (`vibe-buddy`) so the device can show usage bars, reset countdowns, and live work-state animations over BLE.
 
 The StickS3 shows Codex usage over BLE: a GIF pet, a 5-hour usage bar, a 7-day
 usage bar, reset countdowns, and live state changes such as `busy`, `idle`,
@@ -10,8 +10,8 @@ usage bar, reset countdowns, and live state changes such as `busy`, `idle`,
 This project is a personal fork of Anthropic's
 [`claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy)
 reference firmware. The BLE display idea comes from that reference project,
-but this fork is focused on Codex, M5Stack StickS3, GIF pets, and a local Codex
-usage bridge.
+but this fork is focused on multi-agent Stick companion (Codex / Cursor / Pi / …),
+M5Stack StickS3, GIF pets, and the local `vibe-buddy` bridge.
 
 <p align="center">
   <img src="docs/codex-usage-stick-landscape.jpeg" height="500" alt="Codex Usage Stick landscape dashboard">

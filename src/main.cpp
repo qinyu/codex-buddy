@@ -1223,26 +1223,33 @@ static const char* usageTopTitle() {
   return tama.codexAgent[0] ? tama.codexAgent : "CODEX";
 }
 
+static bool agentIdIs(const char* agentId, const char* name) {
+  return agentId && name && strcasecmp(agentId, name) == 0;
+}
+
 static const char* packNameForAgentId(const char* agentId) {
   // Ping Island MascotView exports (idle/working/warning/dragging).
   if (!agentId || !*agentId) return "Mao";
-  if (strcmp(agentId, "codex") == 0) return "Codex";
-  if (strcmp(agentId, "pi") == 0) return "Pi";
-  if (strcmp(agentId, "hermes") == 0) return "Hermes";
-  if (strcmp(agentId, "cursor") == 0) return "Cursor";
+  if (agentIdIs(agentId, "codex")) return "Codex";
+  if (agentIdIs(agentId, "pi")) return "Pi";
+  if (agentIdIs(agentId, "hermes")) return "Hermes";
+  if (agentIdIs(agentId, "cursor")) return "Cursor";
   // Island has no DSH mascot — reuse Kimi keyboard-orb.
-  if (strcmp(agentId, "dsh") == 0 || strcmp(agentId, "kimi") == 0) return "Kimi";
+  if (agentIdIs(agentId, "dsh") || agentIdIs(agentId, "kimi")) return "Kimi";
   // claude / gemini / unknown: Mao until a Stick pack is shipped.
   return "Mao";
 }
 
-static void ensureAgentCharacterPack() {
+static bool ensureAgentCharacterPack() {
   static char lastAgentId[16] = "";
   const char* aid = tama.codexAgentId[0] ? tama.codexAgentId : "codex";
-  if (strcmp(lastAgentId, aid) == 0) return;
+  if (strcasecmp(lastAgentId, aid) == 0) return false;
   strncpy(lastAgentId, aid, sizeof(lastAgentId) - 1);
   lastAgentId[sizeof(lastAgentId) - 1] = 0;
   characterSelect(packNameForAgentId(aid), "Mao");
+  usageFullPushNeeded = true;
+  Serial.printf("[char] agent %s -> pack %s\n", aid, characterCurrentName());
+  return true;
 }
 
 // Long provider titles collapse to the first whitespace-delimited word.
@@ -1647,15 +1654,22 @@ static void drawUsageDashboardLandscape() {
       canvasChanged = true;
     }
 
+    static char cachedPack[24] = "";
+    bool packChanged = strncmp(cachedPack, characterCurrentName(), sizeof(cachedPack)) != 0;
+    if (packChanged) {
+      strncpy(cachedPack, characterCurrentName(), sizeof(cachedPack) - 1);
+      cachedPack[sizeof(cachedPack) - 1] = 0;
+    }
+
     bool stateChanged = cachedPetState != activeState;
-    if (canvasChanged || stateChanged) usagePetSpr.fillSprite(p.bg);
+    if (canvasChanged || stateChanged || packChanged) usagePetSpr.fillSprite(p.bg);
 
     characterSetState(activeState);
     bool frameDrawn = false;
     if (cachedPetW == leftW && cachedPetH == lh) {
       frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
                                      58, 0, 0, leftW, lh);
-      if (orientChanged || canvasChanged || stateChanged || frameDrawn) {
+      if (orientChanged || canvasChanged || stateChanged || packChanged || frameDrawn) {
         usagePetSpr.pushSprite(0, 0);
       }
     } else {
